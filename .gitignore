@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+._*
+
+# Device secrets — NEVER commit WiFi credentials.
+# On the badge these live at /system/secrets.py, not in this repo.
+secrets.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code local settings (personal, not shared)
+.claude/settings.local.json
