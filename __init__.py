@@ -1,77 +1,65 @@
+# TFL bus arrivals + Westminster weather — Pimoroni Badger 2350 (Badgeware v2.0.2)
+#
+# Full design notes, the v2.x API reference and the v4->v2 migration history live
+# in HANDOFF.md; comments here cover only what that doc doesn't, plus brief
+# section/flow markers. The runtime injects its API as globals (screen, color,
+# rom_font, badge, rtc, State, run, wait_for_button_or_alarm, BUTTON_A) — see
+# HANDOFF §5.1; do not import them.
+
 import sys
 import os
 import time
 import socket
-
-# Firmware 2.x: the app runtime INJECTS its API as globals — no import needed,
-# exactly as the stock apps do. Injected names this app uses: screen, color,
-# image, shape, rect, rom_font, badge, rtc, State, run, wait_for_button_or_alarm,
-# the BUTTON_* constants and the display-mode constants.
-#
-# IMPORTANT: do NOT `import rtc` or `from badgeware import run, State`. `import rtc`
-# returns a bare module shell that lacks set_alarm()/datetime() — a DIFFERENT
-# object from the injected `rtc` instance. So we import only real stdlib modules
-# here and reference everything else as injected globals.
+import json   # at top (not lazy): needed at startup for State hydration below
 
 sys.path.insert(0, "/system/apps/tfl")
 os.chdir("/system/apps/tfl")
 
-# The RTC keeps time through sleep, but the system clock (time.localtime()) may
-# reset on the restart that follows each sleep. Copy RTC -> local time at startup
-# so time.localtime() (used for the header clock and footer date) stays correct.
 try:
-    rtc.rtc_to_localtime()
+    rtc.rtc_to_localtime()   # keep time.localtime() correct after a sleep; §5.4
 except Exception:
     pass
+
+# ---- Config knobs (see HANDOFF §10) ----------------------------------------
 
 STOP_ID   = "490003028E"
 STOP_NAME = "Abbey Road"
 MAX_BUSES = 6
 REFRESH_MINS = 2
-WEATHER_MAX_STALE_MINS = 60   # Hide weather older than this; also the retry interval
-
+WEATHER_MAX_STALE_MINS = 60
 WEATHER_LOCATION = "Westminster"
-
-# 2.x sleep model (corrected): wait_for_button_or_alarm(timeout=ms) waits for a
-# button press OR an RTC alarm, then after `timeout` deep-sleeps. With NO alarm
-# set it can only ever be woken by a button — so for periodic refresh we must arm
-# an alarm with rtc.set_alarm() each cycle (see update()). AWAKE_MS is just how
-# long to stay awake after a draw before sleeping; the alarm drives the cadence.
-AWAKE_MS = 5000
+AWAKE_MS = 2000   # was 5000; lowered to cut awake time. A button still wakes the
+                  # device from deep sleep, so a short window costs no responsiveness.
 
 TFL_URL     = "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(STOP_ID)
 WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
 
 REQ_TIMEOUT = 8  # seconds
 
-# 2.x: the old interrupt-flag dance (clear_alarm_flag / enable_alarm_interrupt
-# etc.) is gone. We arm a fresh alarm with rtc.set_alarm() each cycle (in update())
-# to drive the periodic wake; rtc is otherwise only used to read rtc.datetime().
+# ---- Runtime globals (reset on every battery wake; see HANDOFF §5.3) --------
 
 buses       = []
 weather     = None
 error_msg   = None
-last_ok_at  = None     # "HH:MM" of last successful bus fetch
-weather_at  = None     # "HH:MM" of last successful weather fetch
-weather_try_at = None  # "HH:MM" of last weather fetch attempt (success OR failure)
-is_stale    = False    # True when last refresh failed but we have old data
+last_ok_at  = None
+weather_at  = None     # "HH:MM" of last weather SUCCESS (drives display)
+weather_try_at = None  # "HH:MM" of last weather ATTEMPT (drives backoff)
+is_stale    = False
 initialised = False
-last_refresh_minute = -1   # Minutes-since-midnight of last refresh attempt
+last_refresh_minute = -1
 
-# Persistent state — survives deep sleep / module reload
-# Stored as JSON-safe data
+# Persisted across deep sleep / reload (JSON-safe values only).
 persist = {
-    "buses_json": "[]",   # JSON-serialised list of bus dicts
-    "weather":    None,   # tuple as list: [condition, temp, lo, hi]
+    "buses_json": "[]",
+    "weather":    None,
     "last_ok_at": None,
-    "weather_at": None,   # "HH:MM" of last successful weather fetch
-    "weather_try_at": None,  # "HH:MM" of last weather fetch attempt
+    "weather_at": None,
+    "weather_try_at": None,
 }
 State.load("tfl", persist)
 
-# Hydrate the working globals from persisted state
+# Hydrate working globals from persisted state
 try:
-    import json
     buses = json.loads(persist["buses_json"])
 except Exception:
     buses = []
@@ -84,21 +72,19 @@ weather_try_at = persist.get("weather_try_at")
 # ---- Input helpers ---------------------------------------------------------
 
 def _button_a_down():
-    """True if button A is currently pressed.
-
-    Firmware 2.x: button polling is `badge.pressed(BUTTON_A)` (returns truthy
-    when held), replacing v1's `BUTTON_A in io.pressed`. BUTTON_A is a bare
-    injected name. `badge`/BUTTON_A only exist inside the run() context, but
-    this is only ever called from update(), so they're available by then."""
+    """True if button A registered a press this cycle (badge.pressed; §5.5)."""
     try:
         return badge.pressed(BUTTON_A)
     except Exception:
         return False
 
 # ---- Network ---------------------------------------------------------------
+# Raw `network` is used on purpose instead of the stock `wifi` helper: the stock
+# `while not wifi.tick(): pass` blocks forever when offline, whereas the bounded
+# retry below gives up so do_refresh() can fall back to cached/stale data.
 
 def wifi_connected():
-    """Check if WiFi is actually up right now (not just remembered state)."""
+    """Is WiFi actually up right now (not just remembered)?"""
     try:
         import network
         wlan = network.WLAN(network.STA_IF)
@@ -107,6 +93,7 @@ def wifi_connected():
         return False
 
 def connect_wifi():
+    """Bounded (re)connect: ~10s then give up."""
     try:
         import network, secrets
         wlan = network.WLAN(network.STA_IF)
@@ -124,17 +111,16 @@ def connect_wifi():
 # ---- API fetches -----------------------------------------------------------
 
 def _get(url):
-    """HTTP GET with a socket-level timeout. Returns response or raises."""
+    """HTTP GET with timeout. `requests` works on this firmware; stock uses
+    `urequests` if it ever breaks (TypeError fallback documented in §8)."""
     import requests
     try:
-        # Try modern signature with timeout
         return requests.get(url, timeout=REQ_TIMEOUT)
     except TypeError:
-        # Fallback: older firmware without timeout kwarg
         return requests.get(url)
 
 def fetch_arrivals():
-    """True on success; on failure, leaves old buses data intact."""
+    """True on success; on failure leaves old `buses` intact."""
     global buses, last_ok_at
     try:
         r = _get(TFL_URL)
@@ -161,9 +147,8 @@ def fetch_arrivals():
         return False
 
 def save_state():
-    """Persist current data so it survives deep sleep / module reload."""
+    """Persist data so it survives deep sleep / reload."""
     try:
-        import json
         persist["buses_json"] = json.dumps(buses)
         persist["weather"]    = list(weather) if weather else None
         persist["last_ok_at"] = last_ok_at
@@ -174,8 +159,8 @@ def save_state():
         pass
 
 def fetch_weather():
-    """Silent failure — keeps old weather data. Records EVERY attempt (success
-    or failure) so a downed service backs off instead of retrying each cycle."""
+    """Silent failure (keeps old data). Stamps weather_try_at on every attempt
+    for the backoff; saves on all paths. See §8."""
     global weather, weather_at, weather_try_at
     t = rtc.datetime()
     weather_try_at = "{:02d}:{:02d}".format(t[3], t[4])
@@ -191,7 +176,7 @@ def fetch_weather():
             hi        = today["maxtempC"]
             lo        = today["mintempC"]
             weather   = (condition, temp, lo, hi)
-            weather_at = weather_try_at
+            weather_at = weather_try_at   # mark this attempt as the last success
         else:
             r.close()
     except Exception:
@@ -201,6 +186,8 @@ def fetch_weather():
 # ---- Refresh orchestration -------------------------------------------------
 
 def do_refresh(force_weather=False):
+    """Reconnect, fetch buses, fetch weather when due/forced; degrade to
+    stale/error when offline (see §8)."""
     global error_msg, is_stale
 
     try:
@@ -208,12 +195,10 @@ def do_refresh(force_weather=False):
     except Exception:
         pass
 
-    # If WiFi isn't up, try to (re)connect
     if not wifi_connected():
         connect_wifi()
 
     if not wifi_connected():
-        # Couldn't get back online
         if buses:
             is_stale = True
             error_msg = None
@@ -222,8 +207,6 @@ def do_refresh(force_weather=False):
         return
 
     bus_ok = fetch_arrivals()
-    # Weather is fetched at most once per WEATHER_MAX_STALE_MINS (or on manual
-    # press A), so an outage backs off to hourly instead of every 2 min.
     if force_weather or weather_due():
         fetch_weather()
 
@@ -238,7 +221,7 @@ def do_refresh(force_weather=False):
             error_msg = "Could not fetch - press A to retry"
 
 def minutes_since(hhmm):
-    """Minutes elapsed since an 'HH:MM' string, accounting for midnight."""
+    """Minutes since an 'HH:MM' string, wrapping at midnight."""
     if not hhmm:
         return None
     try:
@@ -254,14 +237,12 @@ def minutes_since(hhmm):
         return None
 
 def minutes_since_last_ok():
-    """How many minutes since the last successful fetch (capped at 99)."""
+    """Minutes since last success (capped at 99)."""
     m = minutes_since(last_ok_at)
     return None if m is None else min(m, 99)
 
 def weather_due():
-    """Attempt a fetch only if we've never tried, or it's been at least
-    WEATHER_MAX_STALE_MINS since the last attempt. This is what stops us
-    hammering wttr.in every 2 min during an outage."""
+    """True if a weather fetch is due (backoff; see §8)."""
     if weather_try_at is None:
         return True
     m = minutes_since(weather_try_at)
@@ -270,8 +251,7 @@ def weather_due():
     return m >= WEATHER_MAX_STALE_MINS
 
 def weather_fresh():
-    """True only if we hold weather data younger than WEATHER_MAX_STALE_MINS.
-    When this is False the weather footer is removed from the display."""
+    """True if weather data is younger than the stale threshold."""
     if weather is None or weather_at is None:
         return False
     m = minutes_since(weather_at)
@@ -280,35 +260,28 @@ def weather_fresh():
     return m < WEATHER_MAX_STALE_MINS
 
 # ---- App lifecycle ---------------------------------------------------------
-
-def init():
-    global initialised
-    initialised = False
+# No init(): the module reload on each battery wake already resets the globals
+# above, so it's redundant (the stock apps omit init() too).
 
 def update():
     global initialised, last_refresh_minute
 
-    # Work out elapsed minutes since last refresh using the RTC clock.
-    # (rtc.datetime() still exists; only the alarm API was missing.)
     t = rtc.datetime()
-    current_minute = t[3] * 60 + t[4]   # Minutes since midnight
-
+    current_minute = t[3] * 60 + t[4]
     elapsed = current_minute - last_refresh_minute
-    if elapsed < 0:                     # Crossed midnight
+    if elapsed < 0:                     # crossed midnight
         elapsed += 24 * 60
 
     should_refresh = False
     manual = False
 
-    if not initialised:
+    if not initialised:                 # fresh boot / battery wake -> refresh
         initialised = True
         should_refresh = True
-    elif elapsed >= REFRESH_MINS:
+    elif elapsed >= REFRESH_MINS:       # USB path: time-based refresh
         should_refresh = True
 
-    # 2.x: button press detection moved from `io.BUTTON_A in io.pressed`
-    # to badge.pressed() (see _button_a_down()).
-    if _button_a_down():
+    if _button_a_down():                # manual: also forces a weather fetch
         should_refresh = True
         manual = True
 
@@ -320,26 +293,20 @@ def update():
     screen.pen = color.white
     screen.clear()
 
+    lt = time.localtime()               # reused by header clock + footer date
+
     # Header bar
     screen.pen = color.black
     screen.rectangle(0, 0, screen.width, 18)
     screen.pen = color.white
     screen.font = rom_font.smart
-
-    # LHS: battery %  (2.x: badge.battery_level() replaces get_battery_level())
     try:
         bat = int(badge.battery_level())
         screen.text("{}%".format(bat), 4, 3)
     except Exception:
         pass
-
-    # Centre area: stop name (aligned with Destination column)
-    title = "TFL  {}".format(STOP_NAME)
-    screen.text(title, 50, 3)
-
-    # RHS: current time
-    t = time.localtime()
-    ts = "{:02d}:{:02d}".format(t[3], t[4])
+    screen.text("TFL  {}".format(STOP_NAME), 50, 3)
+    ts = "{:02d}:{:02d}".format(lt[3], lt[4])
     w, _ = screen.measure_text(ts)
     screen.text(ts, screen.width - w - 4, 3)
 
@@ -349,15 +316,11 @@ def update():
         screen.font = rom_font.smart
         screen.text(error_msg, 4, 40)
     else:
-        # Column headers — replaced by stale message when applicable
         screen.font = rom_font.smart
         if is_stale:
             mins = minutes_since_last_ok()
             if mins is not None:
-                screen.text(
-                    "Stale - {} min ago - press A".format(mins),
-                    4, 22
-                )
+                screen.text("Stale - {} min ago - press A".format(mins), 4, 22)
             else:
                 screen.text("Stale - press A to retry", 4, 22)
         else:
@@ -379,47 +342,38 @@ def update():
             screen.text(min_str, screen.width - w - 4, y)
             y += row_h
 
-        # Weather footer — removed entirely once data is older than an hour
+        # Weather footer (hidden once stale)
         if weather_fresh():
             condition, current, lo, hi = weather
             footer_y = screen.height - 14
             screen.pen = color.black
             screen.line(0, footer_y - 4, screen.width, footer_y - 4)
-            # Left: today's date + condition  (e.g. "Sat. 30/05: Partly cloudy")
             DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-            lt = time.localtime()
             date_str = "{}. {:02d}/{:02d}".format(DAYS[lt[6]], lt[2], lt[1])
             left = "{}: {}".format(date_str, condition)
             if len(left) > 28:
                 left = left[:27] + "~"
             screen.text(left, 4, footer_y)
-            # Right: current temp with lo/hi range
             right = "{}C ({}, {})".format(current, lo, hi)
             w, _ = screen.measure_text(right)
             screen.text(right, screen.width - w - 4, footer_y)
 
-    # Push the e-ink only when we actually refreshed/redrew new data. On battery
-    # every wake is a fresh start (should_refresh is True via the init path), so it
-    # always pushes; on USB — where the badge can't deep-sleep and this loops fast
-    # — it avoids redrawing the panel on every spin.
+    # Push e-ink only when we refreshed (avoids constant redraw on USB; §5.3)
     if should_refresh:
         badge.update()
 
-    # Arm the alarm so the device wakes in REFRESH_MINS. Order-agnostic: minutes
-    # sits in the middle whether the signature is (h, m, s) or (s, m, h). Without
-    # this, wait_for_button_or_alarm only ever returns on a button press.
+    # Arm the periodic wake (keyword form like the stock apps; §5.4)
     try:
-        rtc.set_alarm(0, REFRESH_MINS, 0)
+        rtc.set_alarm(minutes=REFRESH_MINS)
     except Exception:
         pass
 
-    # Stay awake briefly for button A, then deep-sleep; the alarm above wakes us
-    # for the periodic refresh (a button also wakes us from sleep).
     wait_for_button_or_alarm(timeout=AWAKE_MS)
 
 def on_exit():
-    pass
+    try:
+        rtc.clear_alarm()   # don't leave a stale wake armed (matches stock apps)
+    except Exception:
+        pass
 
-# 2.x migration: drop the `if __name__ == "__main__"` guard and call run()
-# unconditionally at the end of the module.
 run(update)
