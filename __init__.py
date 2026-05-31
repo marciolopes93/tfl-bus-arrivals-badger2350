@@ -1,11 +1,28 @@
 import sys
 import os
-from badgeware import run, rtc, get_battery_level, State
 import time
 import socket
 
+# Firmware 2.x: the app runtime INJECTS its API as globals — no import needed,
+# exactly as the stock apps do. Injected names this app uses: screen, color,
+# image, shape, rect, rom_font, badge, rtc, State, run, wait_for_button_or_alarm,
+# the BUTTON_* constants and the display-mode constants.
+#
+# IMPORTANT: do NOT `import rtc` or `from badgeware import run, State`. `import rtc`
+# returns a bare module shell that lacks set_alarm()/datetime() — a DIFFERENT
+# object from the injected `rtc` instance. So we import only real stdlib modules
+# here and reference everything else as injected globals.
+
 sys.path.insert(0, "/system/apps/tfl")
 os.chdir("/system/apps/tfl")
+
+# The RTC keeps time through sleep, but the system clock (time.localtime()) may
+# reset on the restart that follows each sleep. Copy RTC -> local time at startup
+# so time.localtime() (used for the header clock and footer date) stays correct.
+try:
+    rtc.rtc_to_localtime()
+except Exception:
+    pass
 
 STOP_ID   = "490003028E"
 STOP_NAME = "Abbey Road"
@@ -15,16 +32,21 @@ WEATHER_MAX_STALE_MINS = 60   # Hide weather older than this; also the retry int
 
 WEATHER_LOCATION = "Westminster"
 
+# 2.x sleep model (corrected): wait_for_button_or_alarm(timeout=ms) waits for a
+# button press OR an RTC alarm, then after `timeout` deep-sleeps. With NO alarm
+# set it can only ever be woken by a button — so for periodic refresh we must arm
+# an alarm with rtc.set_alarm() each cycle (see update()). AWAKE_MS is just how
+# long to stay awake after a draw before sleeping; the alarm drives the cadence.
+AWAKE_MS = 5000
+
 TFL_URL     = "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(STOP_ID)
 WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
 
 REQ_TIMEOUT = 8  # seconds
 
-# Enable RTC interrupts so the alarm wakes the device from sleep
-rtc.clear_alarm_flag()
-rtc.clear_timer_flag()
-rtc.enable_alarm_interrupt(True)
-rtc.enable_timer_interrupt(True)
+# 2.x: the old interrupt-flag dance (clear_alarm_flag / enable_alarm_interrupt
+# etc.) is gone. We arm a fresh alarm with rtc.set_alarm() each cycle (in update())
+# to drive the periodic wake; rtc is otherwise only used to read rtc.datetime().
 
 buses       = []
 weather     = None
@@ -58,6 +80,20 @@ if persist["weather"] is not None:
 last_ok_at = persist["last_ok_at"]
 weather_at = persist.get("weather_at")
 weather_try_at = persist.get("weather_try_at")
+
+# ---- Input helpers ---------------------------------------------------------
+
+def _button_a_down():
+    """True if button A is currently pressed.
+
+    Firmware 2.x: button polling is `badge.pressed(BUTTON_A)` (returns truthy
+    when held), replacing v1's `BUTTON_A in io.pressed`. BUTTON_A is a bare
+    injected name. `badge`/BUTTON_A only exist inside the run() context, but
+    this is only ever called from update(), so they're available by then."""
+    try:
+        return badge.pressed(BUTTON_A)
+    except Exception:
+        return False
 
 # ---- Network ---------------------------------------------------------------
 
@@ -133,7 +169,7 @@ def save_state():
         persist["last_ok_at"] = last_ok_at
         persist["weather_at"] = weather_at
         persist["weather_try_at"] = weather_try_at
-        State.modify("tfl", persist)
+        State.save("tfl", persist)
     except Exception:
         pass
 
@@ -201,13 +237,6 @@ def do_refresh(force_weather=False):
         else:
             error_msg = "Could not fetch - press A to retry"
 
-def set_next_alarm():
-    t = rtc.datetime()
-    total = t[4] + REFRESH_MINS
-    minutes = total % 60
-    hours = (t[3] + (total // 60)) % 24
-    rtc.set_alarm(0, minutes, hours)
-
 def minutes_since(hhmm):
     """Minutes elapsed since an 'HH:MM' string, accounting for midnight."""
     if not hhmm:
@@ -259,10 +288,8 @@ def init():
 def update():
     global initialised, last_refresh_minute
 
-    # Always set the next alarm so the hardware wakes us up periodically
-    set_next_alarm()
-
-    # Work out elapsed minutes since last refresh using the RTC
+    # Work out elapsed minutes since last refresh using the RTC clock.
+    # (rtc.datetime() still exists; only the alarm API was missing.)
     t = rtc.datetime()
     current_minute = t[3] * 60 + t[4]   # Minutes since midnight
 
@@ -279,7 +306,9 @@ def update():
     elif elapsed >= REFRESH_MINS:
         should_refresh = True
 
-    if io.BUTTON_A in io.pressed:
+    # 2.x: button press detection moved from `io.BUTTON_A in io.pressed`
+    # to badge.pressed() (see _button_a_down()).
+    if _button_a_down():
         should_refresh = True
         manual = True
 
@@ -297,9 +326,9 @@ def update():
     screen.pen = color.white
     screen.font = rom_font.smart
 
-    # LHS: battery %
+    # LHS: battery %  (2.x: badge.battery_level() replaces get_battery_level())
     try:
-        bat = int(get_battery_level())
+        bat = int(badge.battery_level())
         screen.text("{}%".format(bat), 4, 3)
     except Exception:
         pass
@@ -341,11 +370,8 @@ def update():
         # Bus rows
         y = 40
         row_h = 16
-        for i, bus in enumerate(buses):
-            if i % 2 == 0:
-                screen.pen = color.light_grey
-                screen.rectangle(0, y - 2, screen.width, row_h)
-                screen.pen = color.black
+        screen.pen = color.black
+        for bus in buses:
             min_str = "Due" if bus["minutes"] == 0 else str(bus["minutes"])
             screen.text(bus["line"],        4,  y)
             screen.text(bus["destination"], 50, y)
@@ -372,8 +398,28 @@ def update():
             w, _ = screen.measure_text(right)
             screen.text(right, screen.width - w - 4, footer_y)
 
+    # Push the e-ink only when we actually refreshed/redrew new data. On battery
+    # every wake is a fresh start (should_refresh is True via the init path), so it
+    # always pushes; on USB — where the badge can't deep-sleep and this loops fast
+    # — it avoids redrawing the panel on every spin.
+    if should_refresh:
+        badge.update()
+
+    # Arm the alarm so the device wakes in REFRESH_MINS. Order-agnostic: minutes
+    # sits in the middle whether the signature is (h, m, s) or (s, m, h). Without
+    # this, wait_for_button_or_alarm only ever returns on a button press.
+    try:
+        rtc.set_alarm(0, REFRESH_MINS, 0)
+    except Exception:
+        pass
+
+    # Stay awake briefly for button A, then deep-sleep; the alarm above wakes us
+    # for the periodic refresh (a button also wakes us from sleep).
+    wait_for_button_or_alarm(timeout=AWAKE_MS)
+
 def on_exit():
     pass
 
-if __name__ == "__main__":
-    run(update)
+# 2.x migration: drop the `if __name__ == "__main__"` guard and call run()
+# unconditionally at the end of the module.
+run(update)

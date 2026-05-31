@@ -6,6 +6,9 @@ stop, plus a one-line **weather summary**. It auto-refreshes on a timer, degrade
 gracefully when offline (keeps showing last-known data with a stale warning), and
 displays the battery level. 🚌
 
+> **Requires Badgeware firmware v2.0.0 or later.** The app uses the v2.x API
+> (`update`/button-press/`mode` calls changed in v2.0). It will **not** run on
+> the older BadgerOS "v4" firmware.
 
 ![App icon](icon.png)
 
@@ -23,7 +26,7 @@ displays the battery level. 🚌
 |------|---------|
 | `__init__.py` | The app. Deploys to `/system/apps/tfl/__init__.py` on the badge. |
 | `icon.png` | 24×24 launcher icon. Deploys to `/system/apps/tfl/icon.png`. |
-| `HANDOFF.md` | Full source-of-truth doc: hardware, BadgerOS v4 API notes, APIs, UI layout, bugs fixed. **Read this before changing code.** |
+| `HANDOFF.md` | Full source-of-truth doc: hardware, Badgeware v2.x API notes, APIs, UI layout, bugs fixed. **Read this before changing code.** |
 
 ## Quick start
 

@@ -1,7 +1,12 @@
 # Badger 2350 TFL Bus + Weather App — Project Handoff
 
-This is the source-of-truth document for the TFL bus arrivals app running on a
-Pimoroni Badger 2350. Read this first before making changes.
+Source-of-truth document for the TFL bus arrivals app running on a Pimoroni
+Badger 2350. **Read this first before making changes.**
+
+> **Firmware note:** This app now targets **Badgeware firmware v2.0.2**. The v2.x
+> API is very different from the older BadgerOS "v4" examples this project
+> started on. Everything below describes v2.x. The old v4 details have been moved
+> to **§13 Legacy** and are no longer used — don't write new code against them.
 
 ---
 
@@ -11,12 +16,12 @@ A MicroPython app for the Pimoroni Badger 2350 e-ink badge that:
 
 - Shows live bus arrival times for a specific London bus stop (TFL data)
 - Shows a one-line weather summary for Westminster at the bottom
-- Auto-refreshes on a timer, balancing data freshness against battery/screen wear
-- Degrades gracefully when offline (keeps showing last-known data with a warning)
+- Auto-refreshes on a timer, balancing freshness against battery/screen wear
+- Degrades gracefully when offline (keeps last-known data with a warning)
 - Shows battery level so stale data is noticeable
 
-The app is already working and has been used in the real world to catch a bus.
-We are now refining behaviour and polish.
+The app works and has been used in the real world to catch a bus. We are now
+refining behaviour and polish.
 
 ---
 
@@ -25,29 +30,38 @@ We are now refining behaviour and polish.
 | Item | Value |
 |------|-------|
 | Device | Pimoroni Badger 2350 |
-| Firmware | BadgerOS **v4.03** |
-| Display | e-ink, `screen.width` x `screen.height` (296 x 128 region used) |
+| Firmware | **Badgeware v2.0.2** |
+| Display | e-ink, 296 x 128 region used (264x176 panel) |
 | Dev tool | Thonny on macOS (MicroPython / Raspberry Pi Pico interpreter) |
 | Connection | USB-C; **must use a data cable, not charge-only** |
+| Docs | https://badgewa.re/docs and https://github.com/pimoroni/badgeware-docs |
+| Firmware repo | https://github.com/pimoroni/badger2350 (releases / changelog) |
 
-### Getting into USB disk mode
-With the badge back-side up: hold **BOOT** (far left), then briefly tap **RESET**.
-A disk appears. In disk mode the disk root **is** the `/system` folder
-(i.e. what you see as `apps/` on the disk = `/system/apps/` on the device).
+### Two different "disk" modes (don't confuse them)
+- **Disk mode (editing app files):** double-tap **RESET**. A disk appears (named
+  "BADGER"/"Badger2350") whose root **is** the `/system` folder — i.e. `apps/` on
+  the disk = `/system/apps/` on the device. Copy app files here.
+- **Firmware flashing:** hold **BOOT**, briefly tap **RESET**. A disk named
+  "RP2350" appears; drop the firmware `.uf2` onto it.
+
+(The original v4 notes conflated these — double-tap RESET is the one for editing
+files.)
 
 ### Connecting in Thonny
 1. Bottom-right interpreter selector → **MicroPython (Raspberry Pi Pico)**
-2. Badge plugged in, NOT in disk mode (running normally)
+2. Badge plugged in, running normally (NOT in disk mode)
 3. Hit the red Stop button to get the `>>>` REPL prompt
 4. Port on Mac looks like `/dev/tty.usbmodem...`
 
+After copying files: safely eject, then press RESET so the launcher rescans.
+`._`-prefixed files on the disk are harmless macOS metadata; ignore them.
+
 ---
 
-## 3. Filesystem layout (IMPORTANT)
+## 3. Filesystem layout
 
-The real filesystem root contains only: `rom`, `system`, `state`.
-
-Apps live at **`/system/apps/`**, NOT `/apps/`. Each app is a folder:
+Real filesystem root contains: `rom`, `system`, `state`. Apps live at
+**`/system/apps/`**. Each app is a folder:
 
 ```
 /system/apps/tfl/
@@ -55,107 +69,154 @@ Apps live at **`/system/apps/`**, NOT `/apps/`. Each app is a folder:
     icon.png        <- launcher icon (MUST be named icon.png)
 ```
 
-WiFi credentials live at **`/system/secrets.py`** (already configured on device)
-with `WIFI_SSID` and `WIFI_PASSWORD`.
+WiFi credentials live at **`/system/secrets.py`** (already configured) with
+`WIFI_SSID` and `WIFI_PASSWORD`.
 
-### Launcher rules (learned from reading the menu app source)
-The menu (`/system/apps/menu/app.py`) only lists an app if BOTH are true:
-1. The path is a directory
-2. It contains a file literally named **`icon.png`**
-
-The app's entry file MUST be **`__init__.py`** (matches the convention of the
-built-in `badge` app). Naming it `tfl.py` will NOT work.
-
-`._`-prefixed files on the disk are harmless macOS metadata; ignore them.
-
-After copying files: safely eject, then press RESET to make the launcher rescan.
+The launcher lists an app only if its folder contains a file literally named
+`icon.png`, and the entry file must be `__init__.py` (matches the stock apps,
+e.g. `gallery`). `/state/` holds per-app saved data written by `State` (§5).
 
 ---
 
 ## 4. The icon
 
-`icon.png` is a **24x24 px black-and-white PNG**, a roundel (circle with a
-horizontal bar) based on the TFL bus roundel. BadgerOS scales the launcher icon
-x2 for display, so keep the source small; a 64px source renders too big and
-overflows neighbouring icons. 24px renders fine.
+`icon.png` is a **24x24 px black-and-white PNG**, a roundel based on the TFL bus
+roundel. The launcher scales it up, so keep the source small (24px renders fine;
+64px overflows neighbouring icons). Must be a real PNG named `icon.png`.
 
-> Note: make sure the deployed file is a real PNG named `icon.png` — a JPEG
-> renamed to `.png` may not decode on the badge.
+> v2.x note: PNGs up to 2048px wide and JPEGs are now supported by the image
+> loader generally, but the 24px launcher icon is unchanged and fine as-is.
 
 ---
 
-## 5. BadgerOS v4 API reference (learned by inspecting built-in apps)
+## 5. Badgeware v2.x API reference (the important part)
 
-This was the single biggest source of friction — the v4 API differs a lot from
-older Badger MicroPython examples online. Key facts:
+This is where almost all the migration effort went. The single biggest concept:
 
-### App structure
-Apps define `init()`, `update()`, `on_exit()` and end with:
+### 5.1 The runtime INJECTS its API — do not import it
+When an app runs, the runtime injects its API straight into the app's namespace
+as globals. **You do not import these, and importing them is actively wrong:**
+
+Injected names (available at module level and inside any function): `screen`,
+`color`, `image`, `shape`, `rect`, `mat3`, `vec2`, `rom_font`, `badge`, `rtc`,
+`State`, `run`, `wait_for_button_or_alarm`, the `BUTTON_*` constants, and the
+display-mode constants (`FAST_UPDATE`, `MEDIUM_UPDATE`, `FULL_UPDATE`, `DITHER`,
+`NON_BLOCKING`).
+
+Only **real stdlib modules** are imported: `sys`, `os`, `time`, `socket`, and
+(lazily, inside functions) `json`, `network`, `requests`, `secrets`.
+
+> ⚠️ `import rtc` does NOT give you the injected `rtc`. It returns a *different*
+> bare module object that lacks `set_alarm`/`datetime`/etc. Likewise
+> `from badgeware import run, State` fails ("no module named 'badgeware.run'")
+> because `run` is a builtin, not a package member. **Reference all of the above
+> as injected globals, never via import.** The stock `gallery` app confirms this:
+> it imports only `os`, `sys`, `ui` and uses everything else injected.
+
+### 5.2 App structure & the run/draw/sleep loop
+End the module with a bare, unconditional `run(update)` (no `if __name__` guard).
+`init()` / `on_exit()` are optional.
+
+On Badger, e-ink updates are costly, so the framework does **not** auto-push the
+display — you must call `badge.update()` yourself when you want the screen to
+refresh. The canonical loop (matches the stock `gallery` app) is:
+
 ```python
-if __name__ == "__main__":
-    run(update)
+def update():
+    ...                         # decide what to do, then draw into `screen`
+    if something_changed:
+        badge.update()          # push the framebuffer to the e-ink
+    rtc.set_alarm(0, MINS, 0)   # arm the periodic wake (see 5.4)
+    wait_for_button_or_alarm(timeout=AWAKE_MS)
+
+run(update)
 ```
-`run()` injects globals into the app's namespace — you do NOT import these:
-`screen`, `io`, `color`, `image`, `brush`, `shape`, `mat3`, `vec2`, `rom_font`.
 
-### Importable from `badgeware`
-`run`, `rtc`, `get_battery_level`, `State`, `clamp`, `is_dir`, `file_exists`,
-`SpriteSheet`, plus more.
+`badge.update()` = `screen.update()` + `badge.clear()` + `badge.poll()`. Buttons
+are polled automatically by the framework each cycle, so you don't poll manually.
 
-### Drawing (`screen`)
-- `screen.pen = color.white` / `color.black` / `color.light_grey`
-- `screen.clear()`, `screen.rectangle(x, y, w, h)`, `screen.line(x1,y1,x2,y2)`
-- `screen.text(string, x, y)` — **y is the text baseline**, not the top. This is
-  why an underline drawn too close to the header text cut through descenders;
-  give a few px clearance below text baselines.
-- `screen.measure_text(string)` → `(w, h)`; used for right-aligning.
-- `screen.font = rom_font.smart` (the small readable font we settled on)
-- `screen.width`, `screen.height`
+### 5.3 Deep sleep & state persistence
+`wait_for_button_or_alarm(timeout=ms)` stays awake polling for that long, then
+**deep-sleeps to save battery**. Deep sleep **resets the device on wake** — the
+module reloads from scratch and all globals are wiped. So persist anything that
+must survive a wake via `State`:
 
-### Fonts
-ROM fonts live in `/rom/fonts/*.ppf`. Accessed as `rom_font.<name>`
-(e.g. `rom_font.smart`, `rom_font.ignore`, `rom_font.ziplock`). We tried
-`rom_font.ignore` (bigger) but it looked "funky"; **we use `rom_font.smart`
-everywhere**. `rom_font` only exists inside the `run()` context.
-
-### Buttons (`io`)
-`if io.BUTTON_A in io.pressed:` — also BUTTON_B, BUTTON_C, BUTTON_UP, BUTTON_DOWN.
-- **Button A** = our manual refresh.
-- **There is no working software "exit to menu"** for our case. Exit is via the
-  hardware Home/Reset buttons on the back. We removed all BUTTON_C / exit code.
-  (Returning a path string from `update()` like the menu does was unreliable
-  here.)
-
-### RTC (`rtc`) — periodic wakeups
-This is how periodic refresh works on e-ink (there is no tight frame loop).
-The clock app pattern:
 ```python
-# At module load — REQUIRED or alarms never fire:
-rtc.clear_alarm_flag()
-rtc.clear_timer_flag()
-rtc.enable_alarm_interrupt(True)
-rtc.enable_timer_interrupt(True)
-# To schedule a wake:
-rtc.set_alarm(seconds, minutes, hours)
+persist = { ...defaults... }
+State.load("tfl", persist)   # hydrate at startup (writes loaded data into dict)
+State.save("tfl", persist)   # save after changes
 ```
-- `rtc.datetime()` → tuple; indices used: `[3]`=hours, `[4]`=minutes.
-- **Do NOT rely on `rtc.read_alarm_flag()` inside `update()`** to detect the
-  wake — the framework appears to clear it before `update()` runs, so that
-  branch never fired (this was a real bug). Instead we always re-arm the alarm
-  and compute elapsed time from the RTC clock.
 
-### State persistence (`State`) — survives deep sleep
-The device deep-sleeps between wakeups, which **reloads the module from scratch
-and wipes all globals**. This caused the "WiFi failed" bug (empty `buses` after
-reload made it take the no-data path instead of the stale path). Fix, per the
-clock app:
-```python
-persist = { ... defaults ... }
-State.load("tfl", persist)     # hydrate at startup
-State.modify("tfl", persist)   # save after changes
-```
-Values must be JSON-safe. We store the bus list as a JSON string
-(`buses_json`) and the weather tuple as a list.
+- `State.load(name, dict)` and `State.save(name, data)` — **note: it's `save`,
+  not `modify`** (v4's `State.modify` no longer exists).
+- Values must be JSON-safe. We store the bus list as a JSON string (`buses_json`)
+  and the weather tuple as a list.
+- **Badger will NOT deep-sleep while on USB power.** On USB the loop just runs
+  fast and never resets, so globals persist there — which is why we still keep an
+  elapsed-time refresh check *and* gate `badge.update()` on "did anything change"
+  (otherwise USB would redraw the panel continuously).
+
+### 5.4 RTC (`rtc`) — periodic wake
+`rtc` is the injected instance. Relevant methods (from `dir(rtc)` on-device):
+`datetime`, `set_alarm`, `clear_alarm`, `alarm_status`, `set_timer`,
+`timer_elapsed`, `rtc_to_localtime`, `localtime_to_rtc`, `time_from_ntp`.
+
+- `rtc.datetime()` → tuple `(year, month, day, hour, minute, second, dow)`. So
+  `[3]`=hour, `[4]`=minute (same indices we used before — handy).
+- `rtc.set_alarm(hours, minutes, seconds)` — fires after that **relative delay**
+  (NOT an absolute wall-clock time like v4). We arm `rtc.set_alarm(0, REFRESH_MINS, 0)`
+  each cycle. (Order-agnostic for us: minutes is the middle arg either way.)
+- **Without arming an alarm, `wait_for_button_or_alarm` can only ever be woken by
+  a button** — this caused the "no auto-refresh after 2 min, but button works"
+  bug. The alarm is what drives the periodic wake.
+- `rtc.rtc_to_localtime()` — copies the RTC (which keeps running through sleep)
+  into the system clock. We call it once at startup so `time.localtime()` (used
+  for the header clock and footer date) is correct after a sleep/reset.
+
+### 5.5 Buttons (`badge`)
+`io` is gone — it's now `badge`. Test a button with `badge.pressed(BUTTON_A)`
+(returns a bool when given a button; returns the list of pressed buttons when
+called with no args). Also `badge.released()`, `badge.held()`, `badge.changed()`.
+- **Button A** = our manual refresh (forces an immediate bus + weather fetch).
+- No software "exit to menu" is wired up; exit via the hardware Home/Reset
+  buttons. (`badge.woken_by_button()` / `woken_by_reset()` exist if needed.)
+
+### 5.6 Other `badge` features (formerly `io` / module functions)
+- `badge.battery_level()` → int %  (was `get_battery_level()`)
+- `badge.battery_voltage()`, `badge.usb_connected()`, `badge.is_charging()`
+- `badge.ticks` / `badge.ticks_delta` (ms), `badge.disk_free("/system")`
+- `badge.mode(...)` (was `mode()`): Badger flags `FAST_UPDATE`, `MEDIUM_UPDATE`,
+  `FULL_UPDATE`, `DITHER`, plus `NON_BLOCKING`. We don't set a mode currently;
+  the default is fine for a 2-minute refresh.
+
+### 5.7 Drawing (`screen`)
+`screen` is an image. Raster primitives we use all still exist: `screen.pen`,
+`screen.font`, `screen.clear()`, `screen.rectangle(x,y,w,h)`,
+`screen.line(x0,y0,x1,y1)`, `screen.text(s, x, y)`, `screen.measure_text(s)` →
+`(w, h)`. Also available: `screen.circle`, `screen.blit`, `screen.dither`,
+`screen.shape(...)` for vector shapes.
+
+- **`screen.text` y is now the TOP-LEFT corner of the text, not the baseline**
+  (this changed from v4). Vertical positions behave differently as a result; the
+  old "underline cutting through descenders" problem is gone because text now
+  sits below its y.
+
+### 5.8 Colour & greys
+The palette is **DawnBringer-16**: `black, grape, navy, grey, brown, green, red,
+taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
+`color.rgb(r,g,b[,a])`, `color.hsv(...)`, `color.oklch(...)`. **There is no
+`color.light_grey`.**
+
+- `color.black` / `color.white` are pure black/white on Badger.
+- A flat grey fill **thresholds to solid black** on the e-ink unless you dither.
+  To show a real grey, use `screen.dither()` (whole-frame) or
+  `badge.mode(... | DITHER)`. *(We removed our only grey — see §7 — so the app is
+  now pure black/white and needs no dithering.)*
+
+### 5.9 Fonts
+`rom_font.<name>` (injected). Available ROM pixel fonts include: `ark`, `compass`,
+`futile`, `ignore`, `nope`, `sins`, `smart`, `yesterday`. **We use
+`rom_font.smart`** everywhere (small, readable). v2.x fonts now support UTF-8.
 
 ---
 
@@ -163,26 +224,22 @@ Values must be JSON-safe. We store the bus list as a JSON string
 
 ### TFL Unified API (buses)
 - Endpoint: `https://api.tfl.gov.uk/StopPoint/{STOP_ID}/Arrivals`
-- **STOP_ID = `490003028E`** (the configured stop; NaptanId from the stop's URL
-  `https://tfl.gov.uk/bus/stop/490003028E/abbey-road/`). STOP_NAME shown = "Abbey Road".
-- No API key required. Rate limits: 50 req/min unauthenticated, 500 req/min with
-  a free key. At a 2-min refresh we make ~30 req/hour — nowhere near limits.
-- Optional future key: register at `api-portal.tfl.gov.uk`, append `?app_key=KEY`.
-- Fields used per arrival: `lineName`, `destinationName`, `timeToStation` (secs;
-  we integer-divide by 60 for minutes). Sorted ascending by minutes.
+- **STOP_ID = `490003028E`** (the configured stop; STOP_NAME = "Abbey Road").
+- No API key required. Limits: 50 req/min unauthenticated; at a 2-min refresh we
+  make ~30 req/hour. Optional future key: `api-portal.tfl.gov.uk`, append
+  `?app_key=KEY`.
+- Fields per arrival: `lineName`, `destinationName`, `timeToStation` (secs →
+  integer-divide by 60 for minutes). Sorted ascending by minutes.
 
 ### wttr.in (weather)
-- **Must use HTTP, not HTTPS** — HTTPS fails on the Badger with
-  `MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE`.
-- We use the JSON endpoint: `http://wttr.in/Westminster?format=j1`
-  - The compact `?format=...` codes `%L`/`%H` (hi/lo) are NOT expanded — they
-    come back as literal "%L"/"%H". That's why we switched to `j1` JSON.
-- Fields used:
-  - `current_condition[0].weatherDesc[0].value` → condition text
-  - `current_condition[0].temp_C` → current temp
-  - `weather[0].maxtempC` / `weather[0].mintempC` → today hi / lo
-- The degree symbol `°` arrives as UTF-8 bytes that render as `Â°` on e-ink, so
-  we never display `°` — we format temps as e.g. `12C` and append C ourselves.
+- **Use HTTP, not HTTPS** — HTTPS fails on the Badger
+  (`MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE`).
+- JSON endpoint: `http://wttr.in/Westminster?format=j1` (the compact `%L`/`%H`
+  format codes come back unexpanded, hence `j1`).
+- Fields: `current_condition[0].weatherDesc[0].value`,
+  `current_condition[0].temp_C`, `weather[0].maxtempC` / `weather[0].mintempC`.
+- We format temps as e.g. `12C` and append the `C` ourselves. (v2.x fonts now
+  support UTF-8, so a real `°` is possible if ever wanted — currently we don't.)
 
 ---
 
@@ -190,108 +247,103 @@ Values must be JSON-safe. We store the bus list as a JSON string
 
 ```
 +------------------------------------------------------------+
-| 84%   TFL  Abbey Road                               08:47  |  <- header bar (black)
+| 84%   TFL  Abbey Road                               08:47  |  <- header bar (black bg, white text)
 |------------------------------------------------------------|
 | Line   Destination                              Min        |  <- col headers (y=22)
-| ---------------------------------------------------------- |  <- line at y=36
-| 18     Euston                                     2        |  <- rows from y=40,
-| 27     Camden Town                                5        |     row_h=16, zebra
-| ...                                                        |     shading on even rows
+| ---------------------------------------------------------- |  <- separator line (y=36)
+| 18     Euston                                     2        |  <- rows from y=40, row_h=16
+| 27     Camden Town                                5        |     plain black-on-white
+| ...                                                        |
 | ---------------------------------------------------------- |
-| Sat. 30/05: Partly cloudy            12C (9, 18)           |  <- weather footer
-+------------------------------------------------------------+               (removed when weather > 1h old)
+| Sat. 30/05: Partly cloudy            12C (9, 18)           |  <- weather footer (removed when >1h old)
++------------------------------------------------------------+
 ```
 
-- **Header**: battery `%` on LHS (x=4), title at x=50 (aligned with Destination
-  column), current time right-aligned. No "LOW" battery text — just the %.
-- **When data is stale**: the Line/Destination/Min header row is replaced by
-  `Stale - {mins} min ago - press A` (minutes capped at 99). No other stale
-  flags anywhere. This clears automatically on the next successful refresh.
-- **Weather footer**: `{Day}. {dd}/{mm}: {condition}` on the left (e.g.
-  `Sat. 30/05: Partly cloudy`; truncated to 28 chars with `~` if needed),
-  `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's date**,
-  not the location — the date comes from `time.localtime()` (tuple
-  `(year, month, mday, hour, minute, second, weekday, yearday)`, `weekday` 0=Mon),
-  using a `DAYS` tuple for the weekday abbreviation. We use `time.localtime()`
-  here (same as the header clock) rather than `rtc.datetime()` because its tuple
-  layout is the documented/reliable one for the date fields. `WEATHER_LOCATION`
-  is still used to build the wttr.in fetch URL — it's just no longer shown in the
-  footer. The entire footer (separator line + both text lines) is **removed**
-  once the weather data is older than `WEATHER_MAX_STALE_MINS` (1h) — we never
-  show stale weather. It reappears on the next successful fetch. Gated by
-  `weather_fresh()`.
+- **Header**: battery `%` LHS (x=4), title at x=50, current time right-aligned.
+  Just the `%`, no "LOW" text.
+- **Bus rows are now plain black text on white** — the old zebra/alternating-row
+  shading was removed (it relied on a grey that the e-ink rendered as solid black;
+  see §9). The display is clean without it, and being pure black/white means no
+  dithering is needed anywhere.
+- **Stale state**: the Line/Destination/Min header row is replaced by
+  `Stale - {mins} min ago - press A` (capped at 99). Clears on next success.
+- **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
+  with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
+  date** from `time.localtime()` (tuple `(year, month, mday, hour, minute, second,
+  weekday, yearday)`, weekday 0=Mon, via a `DAYS` tuple). The whole footer is
+  removed once weather is older than `WEATHER_MAX_STALE_MINS`; gated by
+  `weather_fresh()`. `WEATHER_LOCATION` is used only to build the fetch URL.
+
+> Layout note: because `screen.text` y is now top-left (§5.7), if anything ever
+> looks vertically off after a change, nudge the y values — it won't crash.
 
 ---
 
 ## 8. Refresh & resilience behaviour
 
-- **REFRESH_MINS = 2.** Rationale: TFL predictions are minute-precision and bus
-  ETAs rarely change faster than ~60-90s; 2 min halves WiFi/display cost vs 1 min
-  while staying useful. Press **A** anytime for an instant refresh when you
-  actually need accuracy at the stop. Tunable via `REFRESH_MINS`.
-- **REQ_TIMEOUT = 8s.** Without a timeout, `requests.get()` hangs for minutes
-  when the router is down, freezing the screen (this was a real bug — symptom was
-  the clock not advancing for 5+ min with no warning). We set both
-  `socket.setdefaulttimeout()` and pass `timeout=` to `requests.get` (with a
-  `TypeError` fallback for firmware without the kwarg).
-- **Offline flow** (e.g. router down 5 min): on each wake, `wifi_connected()` is
-  re-checked live; if a fetch fails but we have cached `buses`, we set
-  `is_stale=True` and keep showing old data + the stale header. Full error screen
-  (`... press A to retry`) only shows when there is NO cached data at all (e.g.
-  first-ever launch offline). On reconnect, next refresh clears stale state.
-- **Weather refresh & staleness (`WEATHER_MAX_STALE_MINS = 60`).** Weather is
-  decoupled from the bus cadence and tracked with TWO persisted timestamps:
-  - `weather_at` — last *successful* fetch. Drives the display: `weather_fresh()`
-    is true only if data is younger than 1h, else the footer is removed.
-  - `weather_try_at` — last *attempt* (success OR failure). Drives the retry
-    backoff: `weather_due()` only attempts a fetch if it's been ≥1h since the
-    last attempt. `fetch_weather()` stamps this and calls `save_state()` on every
-    path (including failures), so the backoff survives the deep-sleep module
-    reload — otherwise globals reset and we'd retry every wake.
-  - Net: healthy → weather refreshes ~hourly; outage → footer disappears after
-    1h and we retry only ~hourly (NOT every 2 min). **Press A always force-fetches
-    weather** regardless of backoff (`do_refresh(force_weather=True)`).
-  - Weather failures are still silent and never block the bus fetch.
-  - Note: backoff interval and display-staleness threshold are intentionally the
-    same 60-min knob. To refresh more often when healthy but still back off during
-    outages, split into two constants.
+- **REFRESH_MINS = 2.** TFL predictions are minute-precision; 2 min halves
+  WiFi/display cost vs 1 min while staying useful. Press **A** for an instant
+  refresh. The periodic wake is driven by `rtc.set_alarm(0, REFRESH_MINS, 0)`
+  armed each cycle (§5.4); the device deep-sleeps between wakes on battery.
+- **AWAKE_MS = 5000.** How long `wait_for_button_or_alarm` stays awake after a
+  draw before deep-sleeping. Short, so most of each cycle is spent asleep.
+- **REQ_TIMEOUT = 8s.** Without a timeout, `requests.get()` can hang for minutes
+  when the router is down, freezing the screen. We set `socket.setdefaulttimeout()`
+  and pass `timeout=` to `requests.get` (with a `TypeError` fallback for firmware
+  without the kwarg).
+- **Offline flow**: each wake re-checks `wifi_connected()` live; if a fetch fails
+  but we have cached `buses`, set `is_stale=True` and keep showing old data + the
+  stale header. The full error screen only shows when there is NO cached data
+  (e.g. first-ever launch offline). Reconnect clears stale state next refresh.
+- **Weather staleness/backoff (`WEATHER_MAX_STALE_MINS = 60`)** — two persisted
+  timestamps: `weather_at` (last *success*, drives display via `weather_fresh()`,
+  footer hidden past 1h) and `weather_try_at` (last *attempt*, drives backoff via
+  `weather_due()` so a downed wttr.in is retried at most hourly, not every cycle).
+  `fetch_weather()` stamps `weather_try_at` and saves on every path so the backoff
+  survives the deep-sleep reload. Weather failures are silent and never block the
+  bus fetch. **Press A always force-fetches weather** (`do_refresh(force_weather=True)`).
 
 ---
 
-## 9. Bugs we hit and fixed (so we don't repeat them)
+## 9. Migration learnings & bugs hit (v4 → v2.0.2)
 
-1. **App not in launcher** — files were in `/apps/tfl` (doesn't exist); correct
-   path is `/system/apps/tfl`.
-2. **Still not in launcher** — entry file must be `__init__.py`, and an
-   `icon.png` (that exact name) must be present.
-3. **`ImportError: badger2350`** — wrong module; v4 uses `badgeware`,
-   `requests` (not `urequests`), and the injected globals.
-4. **`'image' object has no attribute 'update'`** — don't call `screen.update()`;
-   the `run()` loop handles drawing.
-5. **`'function' object has no attribute 'exit'`** — `run.exit()` isn't a thing;
-   removed exit logic, use hardware buttons.
-6. **Underline cutting through header text** — `screen.text` y is the baseline;
-   move separator lines down a few px.
-7. **Auto-refresh never firing** — relying on `rtc.read_alarm_flag()` in
-   `update()`; framework clears it first. Switched to elapsed-time check via RTC.
-8. **Alarms never waking device** — must call `rtc.enable_alarm_interrupt(True)`
-   (+ clear flags) at module load.
-9. **"WiFi failed" instead of stale message** — deep sleep wiped globals; fixed
-   with `State` persistence so `buses` survives reloads.
-10. **wttr.in HTTPS fails** — use HTTP.
-11. **`%L`/`%H` not expanding** — use the `j1` JSON endpoint instead.
-12. **`Â°` garbage / `2~` truncation** — strip the degree symbol and reformat
-    temps; move current temp to the right side so it isn't truncated.
-13. **Stale weather shown for hours + retried every 2 min during a wttr.in
-    outage** — when the service went down, the frozen temp kept displaying (no
-    weather equivalent of the bus stale flag) and `weather_due()` (then keyed off
-    last *success*) stayed true, hammering the site every cycle. Fixed by keying
-    display off `weather_at` (hide past 1h) and backoff off `weather_try_at`
-    (attempt at most hourly), persisting both. See §8.
+The hard-won specifics, so we don't repeat them:
+
+1. **`ImportError: no module named 'badgeware.run'`** — `run` is a builtin, not a
+   package member. Don't import it; call `run(update)` bare. Same lesson applies
+   to `State` and the rest: they're injected, not imported (§5.1).
+2. **`AttributeError: 'module' object has no attribute 'clear_alarm_flag'` / `set_alarm`**
+   — caused by `import rtc`, which returns a bare module *different* from the
+   injected `rtc` instance. Drop the import and use the injected `rtc`.
+3. **The old RTC interrupt dance is gone** — no `clear_alarm_flag`,
+   `enable_alarm_interrupt`, etc. Just `rtc.set_alarm(...)`.
+4. **`set_alarm` is a relative delay**, args `(hours, minutes, seconds)` — not the
+   v4 absolute-time signature.
+5. **No auto-refresh, but button works** — because no alarm was armed.
+   `wait_for_button_or_alarm` only returns on a button unless an `rtc.set_alarm`
+   is set to wake it. Arm it each cycle.
+6. **`State.modify` doesn't exist** → use `State.save`.
+7. **`color.light_grey` doesn't exist** (palette is DawnBringer-16). A plain grey
+   fill thresholds to solid black on the e-ink unless dithered — which is why the
+   zebra rows came out black-on-black. We removed the striping entirely (§7).
+8. **`screen.text` y is now top-left, not baseline** — layout shifts vertically.
+9. **`badge.battery_level()`** replaces `get_battery_level()`; `io` → `badge`;
+   button polling is `badge.pressed(BUTTON_A)`.
+10. **Meta-lesson:** the published docs can lag/diverge from the flashed firmware
+    (the docs listed `rtc` methods the *imported* module lacked). When in doubt,
+    trust the device itself — `dir(rtc)`, `dir(badge)` at the REPL — and the
+    stock apps (`gallery`, clock) as the authoritative pattern for your build.
 
 ---
 
-## 10. Conventions / preferences established
+## 10. Config knobs (top of `__init__.py`)
+
+`STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
+`WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`.
+
+---
+
+## 11. Conventions / preferences
 
 - Test changes in Thonny first via:
   ```python
@@ -299,32 +351,66 @@ Values must be JSON-safe. We store the bus list as a JSON string
   import os; os.chdir("/system/apps/tfl")
   exec(open("/system/apps/tfl/__init__.py").read())
   ```
-  (Easier to read errors and paste them back than debugging on-device.)
-- Keep the font as `rom_font.smart`; the bigger font looked off.
-- Keep the UI minimal: no redundant status flags; messages must fit the screen
-  width (we shorten when they overflow).
-- Config knobs live at the top of `__init__.py`: `STOP_ID`, `STOP_NAME`,
-  `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`, `WEATHER_LOCATION`,
-  `REQ_TIMEOUT`.
+  (Easier to read errors and paste them back than debugging on-device.) Note the
+  injected globals (`screen`, `rtc`, `badge`, …) must exist in the REPL session
+  for this to run — they do in the normal app/REPL environment.
+- Keep the font as `rom_font.smart`.
+- Keep the UI minimal and pure black/white: no redundant status flags, no greys;
+  shorten messages that overflow the screen width.
 
 ---
 
-## 11. Open ideas / possible next steps
+## 12. Open ideas / possible next steps
 
-- Verify the deep-sleep + `State` behaviour over a long idle period (hours).
-- Consider showing a tiny "last updated" time even when NOT stale (optional).
-- Consider a low-battery threshold behaviour (currently we only show the %).
-- Worst-case unresponsiveness during back-to-back fetch timeouts (bus + weather
-  ≈ up to 16s): now reduced — weather only fetches ~hourly, so most cycles are
-  bus-only (~8s). Still worth confirming the 16s cycles are acceptable.
-- Possible: split `WEATHER_MAX_STALE_MINS` into separate refresh-interval vs
-  stale-threshold knobs if more-frequent healthy weather refresh is wanted.
+- Confirm the deep-sleep + alarm wake + `State` cycle over a long idle period on
+  **battery** (the USB dev session never actually deep-sleeps, so that path is
+  only lightly exercised so far).
+- If battery life needs work, consider `badge.mode(...)` tuning, or the documented
+  `badge.sleep(REFRESH_MINS*60)` as an alternative to the alarm+wait pair (it
+  wakes on timer or button in a single call).
+- Now that fonts support UTF-8, optionally show a real `°` instead of `C`.
+- Split `WEATHER_MAX_STALE_MINS` into separate refresh-interval vs stale-threshold
+  knobs if more-frequent healthy weather refresh is wanted.
+- Optional low-battery threshold behaviour (currently only the % is shown).
 - Optional: register a TFL app key if usage ever scales.
 
 ---
 
-## 12. Current file
+## 13. Legacy — old BadgerOS "v4" (no longer used)
+
+We started this project on the older v4-era BadgerOS API and have fully migrated
+off it. Kept here only so old code/notes are intelligible. **Do not write new
+code against this.**
+
+### v4 → v2.x quick mapping
+| v4 (old) | v2.0.2 (current) |
+|----------|------------------|
+| `from badgeware import run, rtc, get_battery_level, State` | none — all injected globals (§5.1) |
+| `if __name__ == "__main__": run(update)` | bare `run(update)` |
+| `io.BUTTON_A in io.pressed` | `badge.pressed(BUTTON_A)` |
+| `get_battery_level()` | `badge.battery_level()` |
+| `mode(...)` | `badge.mode(...)` |
+| `rtc.clear_alarm_flag()` / `enable_alarm_interrupt(True)` (at module load) | gone — not needed |
+| `rtc.set_alarm(seconds, minutes, hours)` (absolute) | `rtc.set_alarm(hours, minutes, seconds)` (relative delay) |
+| `rtc.read_alarm_flag()` | `rtc.alarm_status()` (but we don't read it) |
+| `State.modify(name, dict)` | `State.save(name, dict)` |
+| framework auto-draws; don't call `screen.update()` | must call `badge.update()` to push e-ink |
+| `screen.text` y = baseline | `screen.text` y = top-left |
+| `color.light_grey` | gone; use `color.grey`/`color.smoke`/`color.rgb` + dither |
+| no working software exit | still none; use hardware buttons |
+
+### v4-era issues (historical, now irrelevant)
+The v4 build had its own crop of problems we solved at the time — wrong app path
+(`/apps` vs `/system/apps`), `ImportError: badger2350` (it was `badgeware`),
+`'image' object has no attribute 'update'`, `run.exit()` not existing, the alarm
+never firing because `read_alarm_flag()` was cleared before `update()`, and deep
+sleep wiping globals (fixed with `State`). These are all moot under v2.x, which
+reorganised the relevant APIs entirely (see §9 for the v2.x equivalents).
+
+---
+
+## 14. Current file
 
 The working app is a single file: `__init__.py` (deployed to
-`/system/apps/tfl/__init__.py`), plus `icon.png` (24x24) in the same folder.
-The latest version of both accompanies this handoff.
+`/system/apps/tfl/__init__.py`), plus `icon.png` (24x24) in the same folder. The
+latest version of both accompanies this handoff.
