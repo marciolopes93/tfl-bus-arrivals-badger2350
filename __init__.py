@@ -78,6 +78,43 @@ def _button_a_down():
     except Exception:
         return False
 
+# ---- Battery ---------------------------------------------------------------
+# This firmware's badge.battery_level() is unreliable: it reports 100 while
+# charging and 0 on battery, never a real in-between value. badge.battery_voltage()
+# IS accurate, so we derive % from voltage via a LiPo curve instead. While
+# charging the cell voltage is held high (so % is meaningless) — show "chg",
+# matching the stock launcher's behaviour.
+
+# Approx single-cell LiPo discharge curve: (volts, percent), ascending.
+_LIPO_CURVE = ((3.30, 0), (3.50, 10), (3.60, 20), (3.70, 40),
+               (3.80, 60), (3.90, 75), (4.00, 88), (4.20, 100))
+
+def _pct_from_voltage(v):
+    if v <= _LIPO_CURVE[0][0]:
+        return 0
+    if v >= _LIPO_CURVE[-1][0]:
+        return 100
+    for i in range(1, len(_LIPO_CURVE)):
+        v0, p0 = _LIPO_CURVE[i - 1]
+        v1, p1 = _LIPO_CURVE[i]
+        if v <= v1:
+            return int(p0 + (p1 - p0) * (v - v0) / (v1 - v0))
+    return 100
+
+def battery_text():
+    """Header meter string: 'chg' while charging, else a voltage-derived %.
+    Read this BEFORE WiFi comes up — the ADC can read low while the radio is
+    active on RP2350 boards."""
+    try:
+        if badge.is_charging():
+            return "chg"
+    except Exception:
+        pass
+    try:
+        return "{}%".format(_pct_from_voltage(badge.battery_voltage()))
+    except Exception:
+        return ""
+
 # ---- Network ---------------------------------------------------------------
 # Raw `network` is used on purpose instead of the stock `wifi` helper: the stock
 # `while not wifi.tick(): pass` blocks forever when offline, whereas the bounded
@@ -285,6 +322,8 @@ def update():
         should_refresh = True
         manual = True
 
+    bat_str = battery_text()            # read BEFORE WiFi comes up (see helper)
+
     if should_refresh:
         do_refresh(force_weather=manual)
         last_refresh_minute = current_minute
@@ -300,11 +339,8 @@ def update():
     screen.rectangle(0, 0, screen.width, 18)
     screen.pen = color.white
     screen.font = rom_font.smart
-    try:
-        bat = int(badge.battery_level())
-        screen.text("{}%".format(bat), 4, 3)
-    except Exception:
-        pass
+    if bat_str:
+        screen.text(bat_str, 4, 3)
     screen.text("TFL  {}".format(STOP_NAME), 50, 3)
     ts = "{:02d}:{:02d}".format(lt[3], lt[4])
     w, _ = screen.measure_text(ts)

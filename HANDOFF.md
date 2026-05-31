@@ -182,8 +182,19 @@ called with no args). Also `badge.released()`, `badge.held()`, `badge.changed()`
   buttons. (`badge.woken_by_button()` / `woken_by_reset()` exist if needed.)
 
 ### 5.6 Other `badge` features (formerly `io` / module functions)
-- `badge.battery_level()` → int %  (was `get_battery_level()`)
-- `badge.battery_voltage()`, `badge.usb_connected()`, `badge.is_charging()`
+- `badge.battery_level()` → int % (was `get_battery_level()`). **⚠️ Unreliable on
+  v2.0.2: it only ever reports `100` (while charging) or `0` (on battery) — never
+  a real in-between value. Do NOT use it for the meter.** Confirmed on-device:
+  4.22 V on USB → `battery_level()` 100 / `is_charging()` 1; 4.17 V on battery
+  (after ~90 min) → `battery_level()` 0 / `is_charging()` 0. See §9.10.
+- `badge.battery_voltage()` → float volts. **Accurate** (tracked 4.22 → 4.17 V
+  over 90 min). This is what the app uses: it derives % from voltage via a LiPo
+  curve (`_LIPO_CURVE` / `_pct_from_voltage()`), and shows `"chg"` while charging
+  (cell is held high then, so a % would be meaningless — matches stock launcher).
+  Read the meter BEFORE bringing WiFi up: the ADC can read low while the radio is
+  active on RP2350 boards.
+- `badge.usb_connected()`, `badge.is_charging()` — both verified working (flip
+  1 → 0 correctly on unplug).
 - `badge.ticks` / `badge.ticks_delta` (ms), `badge.disk_free("/system")`
 - `badge.mode(...)` (was `mode()`): Badger flags `FAST_UPDATE`, `MEDIUM_UPDATE`,
   `FULL_UPDATE`, `DITHER`, plus `NON_BLOCKING`. We don't set a mode currently;
@@ -259,8 +270,10 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 +------------------------------------------------------------+
 ```
 
-- **Header**: battery `%` LHS (x=4), title at x=50, current time right-aligned.
-  Just the `%`, no "LOW" text.
+- **Header**: battery meter LHS (x=4), title at x=50, current time right-aligned.
+  The meter shows a voltage-derived `%` on battery, or `"chg"` while charging
+  (see §5.6 / §9.10 — `battery_level()` is unusable, so we map `battery_voltage()`
+  through a LiPo curve). Just the meter, no "LOW" text.
 - **Bus rows are now plain black text on white** — the old zebra/alternating-row
   shading was removed (it relied on a grey that the e-ink rendered as solid black;
   see §9). The display is clean without it, and being pure black/white means no
@@ -328,11 +341,27 @@ The hard-won specifics, so we don't repeat them:
    zebra rows came out black-on-black. We removed the striping entirely (§7).
 8. **`screen.text` y is now top-left, not baseline** — layout shifts vertically.
 9. **`badge.battery_level()`** replaces `get_battery_level()`; `io` → `badge`;
-   button polling is `badge.pressed(BUTTON_A)`.
-10. **Meta-lesson:** the published docs can lag/diverge from the flashed firmware
-    (the docs listed `rtc` methods the *imported* module lacked). When in doubt,
-    trust the device itself — `dir(rtc)`, `dir(badge)` at the REPL — and the
-    stock apps (`gallery`, clock) as the authoritative pattern for your build.
+   button polling is `badge.pressed(BUTTON_A)`. (But `battery_level()` itself is
+   unusable on this firmware — see item 10.)
+10. **`badge.battery_level()` reports 0/100 only — meter showed a wrong value.**
+    Symptom: the header stuck at 100% even when unplugged. On-device readings
+    (via a temporary debug strip) showed `battery_level()` returns 100 while
+    charging and 0 on battery, with nothing in between, while `battery_voltage()`
+    tracked the real cell (4.22 V on USB → 4.17 V after ~90 min on battery).
+    `is_charging()`/`usb_connected()` were fine (flipped 1 → 0 on unplug). Fix:
+    derive % from `battery_voltage()` via `_LIPO_CURVE`/`_pct_from_voltage()`, and
+    show `"chg"` while charging instead of a number. Read the meter before WiFi
+    comes up (radio activity can skew the ADC). Two pages found while debugging
+    (`badger.github.io/hack/battery-percentage` and the launcher's `menu/ui.py`)
+    document the *legacy v4* API (`get_battery_level()`/`is_charging()` as free
+    imports, `screen.brush`/`shapes`/`io.ticks`) — useful for the "chg" idea, but
+    do NOT copy their calls; they don't exist on v2.0.2 (§13).
+11. **Meta-lesson:** the published docs can lag/diverge from the flashed firmware
+    (the docs listed `rtc` methods the *imported* module lacked; the battery
+    pages above are for a different API entirely). When in doubt, trust the device
+    itself — `dir(rtc)`, `dir(badge)`, and live value reads at the REPL or via an
+    on-screen debug strip — and the stock apps (`gallery`, clock) as the
+    authoritative pattern for your build.
 
 ---
 
@@ -340,6 +369,10 @@ The hard-won specifics, so we don't repeat them:
 
 `STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
 `WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`.
+
+Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
+voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
+the voltage where the badge actually dies, and set that as the `0%` point.
 
 ---
 
@@ -371,7 +404,9 @@ The hard-won specifics, so we don't repeat them:
 - Now that fonts support UTF-8, optionally show a real `°` instead of `C`.
 - Split `WEATHER_MAX_STALE_MINS` into separate refresh-interval vs stale-threshold
   knobs if more-frequent healthy weather refresh is wanted.
-- Optional low-battery threshold behaviour (currently only the % is shown).
+- Optional low-battery threshold behaviour (currently only the meter is shown).
+  Now that % comes from voltage, a warning could trigger off a voltage cutoff
+  (e.g. < 3.5 V) rather than the unreliable `battery_level()`.
 - Optional: register a TFL app key if usage ever scales.
 
 ---
@@ -388,7 +423,7 @@ code against this.**
 | `from badgeware import run, rtc, get_battery_level, State` | none — all injected globals (§5.1) |
 | `if __name__ == "__main__": run(update)` | bare `run(update)` |
 | `io.BUTTON_A in io.pressed` | `badge.pressed(BUTTON_A)` |
-| `get_battery_level()` | `badge.battery_level()` |
+| `get_battery_level()` | `badge.battery_level()` **but it reads 0/100 only — use `battery_voltage()` + curve; see §5.6/§9.10** |
 | `mode(...)` | `badge.mode(...)` |
 | `rtc.clear_alarm_flag()` / `enable_alarm_interrupt(True)` (at module load) | gone — not needed |
 | `rtc.set_alarm(seconds, minutes, hours)` (absolute) | `rtc.set_alarm(hours, minutes, seconds)` (relative delay) |
