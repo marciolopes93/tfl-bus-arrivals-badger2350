@@ -34,6 +34,8 @@ WEATHER_MAX_STALE_MINS = 60
 WEATHER_LOCATION = "Westminster"
 AWAKE_MS = 2000   # was 5000; lowered to cut awake time. A button still wakes the
                   # device from deep sleep, so a short window costs no responsiveness.
+RTC_MIN_VALID_YEAR = 2024   # below this the RTC has reset to its 2000 epoch
+                            # (after a full battery death) -> trigger an NTP re-sync.
 
 TFL_URL     = "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(STOP_ID)
 WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
@@ -118,6 +120,62 @@ def battery_text():
         return "{}%".format(_pct_from_voltage(badge.battery_voltage()))
     except Exception:
         return ""
+
+# ---- Clock / timezone ------------------------------------------------------
+# The RTC keeps time off the LiPo through deep sleep, but a FULL battery death
+# wipes it back to its 2000-01-01 epoch (the device does NOT self-sync from the
+# net; see HANDOFF §9.13). We re-sync via rtc.time_from_ntp() — but NTP is UTC and
+# this firmware has no set_datetime() (only set_alarm/set_timer; confirmed by
+# dir(rtc)), so we keep the RTC on UTC and apply the UK offset only at DISPLAY
+# time. All internal timing (staleness, last_ok, the alarm delay) stays UTC —
+# it's all relative/differences, so it needs no conversion.
+
+def _dow(y, mo, d):
+    """Day-of-week 0=Mon..6=Sun for a date (matches rtc.datetime()[6])."""
+    return time.localtime(time.mktime((y, mo, d, 12, 0, 0, 0, 0)))[6]
+
+def _last_sunday(y, mo):
+    """Date of the last Sunday in a month (always >= 25 for Mar/Oct)."""
+    for d in range(31, 24, -1):
+        try:
+            if _dow(y, mo, d) == 6:
+                return d
+        except Exception:
+            pass
+    return 25
+
+def _uk_is_bst(y, mo, d, hh):
+    """True if the UK is on BST (UTC+1) at the given UTC datetime. BST runs from
+    01:00 UTC on the last Sunday of March to 01:00 UTC on the last Sunday of Oct."""
+    if mo < 3 or mo > 10:
+        return False
+    if 3 < mo < 10:
+        return True
+    ls = _last_sunday(y, mo)
+    if mo == 3:
+        return d > ls or (d == ls and hh >= 1)
+    return d < ls or (d == ls and hh < 1)   # October
+
+def london_now():
+    """Current London wall-clock as a localtime-style tuple: the UTC system clock
+    plus the BST/GMT offset. Used only for the header clock + footer date."""
+    t = time.localtime()                     # UTC (RTC is kept on UTC)
+    if _uk_is_bst(t[0], t[1], t[2], t[3]):
+        return time.localtime(time.mktime(t) + 3600)
+    return t
+
+def sync_clock_if_needed():
+    """No-op unless the RTC looks unset (year < RTC_MIN_VALID_YEAR), i.e. after a
+    battery death. Then re-sync from NTP (UTC) and mirror into the system clock.
+    Self-healing: a failed NTP attempt leaves the clock unset and retries next
+    refresh, so it catches up on its own once the network is reachable."""
+    try:
+        if rtc.datetime()[0] >= RTC_MIN_VALID_YEAR:
+            return
+        rtc.time_from_ntp()      # sets the RTC to UTC
+        rtc.rtc_to_localtime()   # mirror UTC into time.localtime()
+    except Exception:
+        pass
 
 # ---- Network ---------------------------------------------------------------
 # Raw `network` is used on purpose instead of the stock `wifi` helper: the stock
@@ -247,6 +305,8 @@ def do_refresh(force_weather=False):
             error_msg = "WiFi failed - press A to retry"
         return
 
+    sync_clock_if_needed()   # re-sync the RTC if a battery death reset it (§9.13)
+
     bus_ok = fetch_arrivals()
     if force_weather or weather_due():
         fetch_weather()
@@ -336,7 +396,7 @@ def update():
     screen.pen = color.white
     screen.clear()
 
-    lt = time.localtime()               # reused by header clock + footer date
+    lt = london_now()                   # UK wall-clock; header clock + footer date
 
     # Header bar
     screen.pen = color.black
