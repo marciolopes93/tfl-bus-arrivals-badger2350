@@ -186,6 +186,16 @@ State.save("tfl", persist)   # save after changes
 - `rtc.rtc_to_localtime()` — copies the RTC (which keeps running through sleep)
   into the system clock. We call it once at startup so `time.localtime()` (used
   for the header clock and footer date) is correct after a sleep/reset.
+- `rtc.time_from_ntp()` — fetches the time over the network and sets the RTC to
+  **UTC**. We only call it when the RTC looks unset (`datetime()[0] < RTC_MIN_VALID_YEAR`),
+  i.e. after a full battery death wiped it to the 2000 epoch (§9.13). Needs WiFi
+  up first (a bare-REPL call with no connection raises `OSError -6` from inside
+  `ntptime.py`). **No `set_datetime()` exists on this firmware** — `dir(rtc)`
+  shows only `set_alarm`/`set_timer` as setters — so we cannot write a corrected
+  local time into the RTC. We keep the RTC on UTC and apply the UK BST/GMT offset
+  only at **display** time via `london_now()` (§5.7 / §9.13). Internal timing
+  (staleness, `last_ok_at`, the alarm delay) stays UTC; it's all relative, so it
+  needs no conversion.
 
 ### 5.5 Buttons (`badge`)
 `io` is gone — it's now `badge`. Test a button with `badge.pressed(BUTTON_A)`
@@ -287,7 +297,9 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 - **Header**: battery meter LHS (x=4), title at x=50, current time right-aligned.
   The meter shows a voltage-derived `%` on battery, or `"chg"` while charging
   (see §5.6 / §9.10 — `battery_level()` is unusable, so we map `battery_voltage()`
-  through a LiPo curve). Just the meter, no "LOW" text.
+  through a LiPo curve). Just the meter, no "LOW" text. The clock and footer date
+  are drawn from `london_now()`, not raw `time.localtime()`: the RTC is kept on
+  UTC and the UK BST/GMT offset is applied at display time only (§5.4 / §9.13).
 - **Bus rows are now plain black text on white** — the old zebra/alternating-row
   shading was removed (it relied on a grey that the e-ink rendered as solid black;
   see §9). The display is clean without it, and being pure black/white means no
@@ -296,8 +308,9 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   `Stale - {mins} min ago - press A` (capped at 99). Clears on next success.
 - **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
   with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
-  date** from `time.localtime()` (tuple `(year, month, mday, hour, minute, second,
-  weekday, yearday)`, weekday 0=Mon, via a `DAYS` tuple). The whole footer is
+  date** from `london_now()` (a localtime-style tuple `(year, month, mday, hour,
+  minute, second, weekday, yearday)`, weekday 0=Mon, via a `DAYS` tuple). The
+  whole footer is
   removed once weather is older than `WEATHER_MAX_STALE_MINS`; gated by
   `weather_fresh()`. `WEATHER_LOCATION` is used only to build the fetch URL.
 
@@ -403,13 +416,34 @@ The hard-won specifics, so we don't repeat them:
     retry (§5.4 / §8). **Watchdog ruled out:** `machine.WDT` max timeout on RP2350
     is shorter than the 2-min sleep, so it would spuriously reset every normal
     cycle. **Pending on-device validation** on battery past the ~48h mark.
+13. **Full battery death resets the clock to 2000-01-01 (Sat 00:00).** Symptom:
+    after the LiPo fully died, the screen came back blank (a normal brownout — the
+    panel was mid-`update()` after `screen.clear()`, unlike the §9.12 freeze which
+    retained its last frame because power stayed on), and on reopening, the header
+    clock read `00:00` and the footer `Sat 01/01`. Both are one event: the RTC
+    runs off the LiPo and reverts to its 2000-01-01 epoch when the cell dies, and
+    1 Jan 2000 was a Saturday. **The device does NOT self-sync the clock from the
+    net** — whatever set it originally doesn't re-run; our app only ever called
+    `rtc.rtc_to_localtime()` (RTC→system copy), never a fetch. Fix: call
+    `rtc.time_from_ntp()` (the unused method from §5.4) once WiFi is up, gated on
+    the RTC year looking unset (`< RTC_MIN_VALID_YEAR`) so normal deep-sleep wakes
+    skip it. NTP returns **UTC** and there's no `set_datetime()` to write a
+    corrected local value back (only `set_alarm`/`set_timer`; confirmed via
+    `dir(rtc)`), so the RTC stays UTC and the UK offset is applied at display time
+    only — `london_now()` adds +1h during BST via a computed last-Sunday rule
+    (no table, no hard-coded month), verified at the spring/autumn boundary hours.
+    On-device check confirmed `time_from_ntp()` returns UTC: it read 10:45 when
+    London was 11:45 BST. The sync is self-healing — a failed NTP attempt leaves
+    the clock unset and retries next refresh.
 
 ---
 
 ## 10. Config knobs (top of `__init__.py`)
 
 `STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
-`WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`.
+`WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`, `RTC_MIN_VALID_YEAR` (the year
+below which the RTC is treated as reset-to-epoch and an NTP re-sync is triggered;
+§5.4 / §9.13).
 
 Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
 voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
