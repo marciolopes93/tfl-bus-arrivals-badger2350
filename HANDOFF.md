@@ -169,6 +169,20 @@ State.save("tfl", persist)   # save after changes
 - **Without arming an alarm, `wait_for_button_or_alarm` can only ever be woken by
   a button** — this caused the "no auto-refresh after 2 min, but button works"
   bug. The alarm is what drives the periodic wake.
+- **Arm defensively (see §9.12).** A silently-swallowed `set_alarm()` failure was
+  the cause of the ~48h deep-sleep freeze. The arm is now a verified retry: clear
+  the flag, `set_alarm`, and on exception retry (up to 3x). We only enter
+  `wait_for_button_or_alarm` once an alarm is actually armed; if all retries fail
+  we return and let `run()` re-call `update()` rather than deep-sleeping with no
+  wake source.
+- **No reliable "is an alarm armed?" query.** `rtc.alarm_status()` reads the
+  *fired* flag (it's the old v4 `read_alarm_flag`, §13), not the armed state — it
+  reads False right after a successful `set_alarm`. So "verify it took" can only
+  catch an *exception*; there's no clean post-arm confirmation poll.
+- `rtc.clear_alarm()` — clears the alarm/flag. We call it (a) at startup, before
+  arming a fresh alarm, so a stale/latched flag can't wedge the next wake — on
+  battery every wake is a fresh module load, so this runs each cycle; (b) inside
+  the arm retry before each `set_alarm`; and (c) in `on_exit()`.
 - `rtc.rtc_to_localtime()` — copies the RTC (which keeps running through sleep)
   into the system clock. We call it once at startup so `time.localtime()` (used
   for the header clock and footer date) is correct after a sleep/reset.
@@ -296,10 +310,13 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 
 - **REFRESH_MINS = 2.** TFL predictions are minute-precision; 2 min halves
   WiFi/display cost vs 1 min while staying useful. Press **A** for an instant
-  refresh. The periodic wake is driven by `rtc.set_alarm(0, REFRESH_MINS, 0)`
-  armed each cycle (§5.4); the device deep-sleeps between wakes on battery.
-- **AWAKE_MS = 5000.** How long `wait_for_button_or_alarm` stays awake after a
-  draw before deep-sleeping. Short, so most of each cycle is spent asleep.
+  refresh. The periodic wake is driven by an alarm armed each cycle as a verified
+  retry (`rtc.clear_alarm()` + `rtc.set_alarm(minutes=REFRESH_MINS)`, retried on
+  failure; §5.4 / §9.12); the device deep-sleeps between wakes on battery. A flag
+  clear at startup (§5.4) prevents a stale alarm flag wedging the next wake.
+- **AWAKE_MS = 2000.** How long `wait_for_button_or_alarm` stays awake after a
+  draw before deep-sleeping. Short, so most of each cycle is spent asleep (a
+  button still wakes from deep sleep, so the short window costs no responsiveness).
 - **REQ_TIMEOUT = 8s.** Without a timeout, `requests.get()` can hang for minutes
   when the router is down, freezing the screen. We set `socket.setdefaulttimeout()`
   and pass `timeout=` to `requests.get` (with a `TypeError` fallback for firmware
@@ -362,6 +379,30 @@ The hard-won specifics, so we don't repeat them:
     itself — `dir(rtc)`, `dir(badge)`, and live value reads at the REPL or via an
     on-screen debug strip — and the stock apps (`gallery`, clock) as the
     authoritative pattern for your build.
+12. **~48h deep-sleep freeze — device dark until manual reset.** Symptom: ran fine
+    for ~48h (~1,400 wake cycles at REFRESH_MINS=2), then dropped off the network
+    and froze on its last drawn frame (e-ink retains the image with no power); a
+    reset + reopen recovered it instantly, battery was fine (~31%). Root cause: the
+    arm was fire-and-forget —
+    ```python
+    try:
+        rtc.set_alarm(minutes=REFRESH_MINS)
+    except Exception:
+        pass
+    wait_for_button_or_alarm(timeout=AWAKE_MS)
+    ```
+    If `set_alarm()` ever failed on a cycle, the `except: pass` swallowed it and
+    the device deep-slept with **no wake source** — only a button/reset could
+    revive it. Over ~1,400 cycles the cumulative odds of one such failure add up
+    (statistical, not deterministic — hence ~48h, not a fixed time). Contributing
+    factor: the alarm flag was never cleared across wakes (v1.0.0 cleared it at
+    load; v2.x only cleared in `on_exit()`, which doesn't run across a deep-sleep
+    reset). Fix (two parts): (a) `rtc.clear_alarm()` at startup so each fresh wake
+    starts from a clean flag; (b) replace the silent arm with a verified retry that
+    only deep-sleeps once an alarm is armed, and otherwise returns to let `run()`
+    retry (§5.4 / §8). **Watchdog ruled out:** `machine.WDT` max timeout on RP2350
+    is shorter than the 2-min sleep, so it would spuriously reset every normal
+    cycle. **Pending on-device validation** on battery past the ~48h mark.
 
 ---
 
@@ -395,12 +436,15 @@ the voltage where the badge actually dies, and set that as the `0%` point.
 
 ## 12. Open ideas / possible next steps
 
-- Confirm the deep-sleep + alarm wake + `State` cycle over a long idle period on
-  **battery** (the USB dev session never actually deep-sleeps, so that path is
-  only lightly exercised so far).
-- If battery life needs work, consider `badge.mode(...)` tuning, or the documented
-  `badge.sleep(REFRESH_MINS*60)` as an alternative to the alarm+wait pair (it
-  wakes on timer or button in a single call).
+- **Validate the deep-sleep freeze fix on battery (§9.12).** The arm is now a
+  verified retry + startup flag-clear; confirm the device survives past the ~48h
+  mark where it previously froze. The USB dev session never deep-sleeps, so this
+  alarm-wake path is still the lightly-exercised one — leave it on battery to
+  exercise it (the ~31% reading at the last freeze leaves ample runway to test).
+- If battery life needs work, consider `badge.mode(...)` tuning.
+- **Migrate the periodic wake to `badge.sleep()` (the cleaner fix).** Detailed
+  proposal in **§12.1** below — a structural replacement for the arm+wait pair
+  that would supersede the §9.12 retry. Deferred until verified on-device.
 - Now that fonts support UTF-8, optionally show a real `°` instead of `C`.
 - Split `WEATHER_MAX_STALE_MINS` into separate refresh-interval vs stale-threshold
   knobs if more-frequent healthy weather refresh is wanted.
@@ -408,6 +452,75 @@ the voltage where the badge actually dies, and set that as the `0%` point.
   Now that % comes from voltage, a warning could trigger off a voltage cutoff
   (e.g. < 3.5 V) rather than the unreliable `battery_level()`.
 - Optional: register a TFL app key if usage ever scales.
+
+### 12.1 Proposed cleaner wake mechanism: `badge.sleep()` (deferred)
+
+**Status:** proposed, NOT yet implemented or verified on v2.0.2. The current
+shipped mechanism is the §9.12 verified-retry arm. This is the cleaner replacement
+to migrate to *after* on-device verification.
+
+**Why.** The current wake is two separate steps at the end of `update()`: arm the
+alarm (`rtc.set_alarm`), then sleep (`wait_for_button_or_alarm`). The §9.12 freeze
+existed precisely *because* they're separate — if arming fails, the sleep still
+runs and the device sleeps with no wake source. The §9.12 fix makes that gap
+*safe* (retry; only sleep once armed; otherwise return and let `run()` retry), but
+the gap is still structurally present and guarded by defensive code.
+
+`badge.sleep(seconds)` is documented as a single, indivisible call that arms a
+timer, deep-sleeps, and wakes on timer **or** button. There's no gap between
+arming and sleeping, so the §9.12 failure mode cannot occur by construction —
+a structural fix rather than a defensive one.
+
+**The swap.** Replace the §9.12 arm-retry + `wait_for_button_or_alarm` block at
+the end of `update()`:
+
+```python
+# CURRENT (§9.12 verified-retry arm)
+armed = False
+for _ in range(3):
+    try:
+        rtc.clear_alarm()
+        rtc.set_alarm(minutes=REFRESH_MINS)
+        armed = True
+        break
+    except Exception:
+        time.sleep(0.2)
+if armed:
+    wait_for_button_or_alarm(timeout=AWAKE_MS)
+```
+
+with:
+
+```python
+# PROPOSED (atomic sleep)
+badge.sleep(REFRESH_MINS * 60)
+```
+
+**What it supersedes / removes if adopted:**
+- The 3x arm-retry loop and the `armed` guard (§9.12) — no longer needed.
+- `AWAKE_MS` becomes unused on the battery path (no separate awake window before
+  sleeping); check whether the USB path still needs it (see verification below).
+- Possibly the startup `rtc.clear_alarm()` — keep it initially as cheap insurance;
+  only remove once confident `badge.sleep()` manages its own flag.
+- The `on_exit()` `rtc.clear_alarm()` can stay (harmless, matches stock apps).
+
+**Verification checklist (do ALL on the actual badge before adopting — docs
+diverge from firmware on this device, §9.11):**
+1. **Exists & doesn't raise:** `dir(badge)` shows `sleep`; calling it doesn't
+   throw on v2.0.2.
+2. **Timer wake:** on battery, the device wakes and refreshes after ~REFRESH_MINS
+   (not just on a button).
+3. **Button wake:** a button press still wakes it early from the sleep (so manual
+   refresh / responsiveness is preserved).
+4. **USB behaviour:** on USB (where the badge won't truly deep-sleep), confirm the
+   call returns and the loop keeps running rather than blocking or busy-spinning —
+   this is the riskiest case. If it blocks/misbehaves on USB, either keep a
+   USB-power branch using the old arm+wait, or gate `badge.sleep()` on
+   `not badge.usb_connected()`.
+5. **Survives the ~48h mark** on battery, same as the §9.12 validation.
+
+**Rollback:** if any check fails, revert to the §9.12 block (it's the proven
+mechanism). Keep both documented here until `badge.sleep()` has cleared all five.
 
 ---
 
