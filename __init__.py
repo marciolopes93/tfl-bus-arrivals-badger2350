@@ -388,25 +388,47 @@ def weather_fresh():
 # No init(): the module reload on each battery wake already resets the globals
 # above, so it's redundant (the stock apps omit init() too).
 
+def _outline_rect(x, y, w, h, t=4):
+    """Hollow rectangle: filled black, then a white inset -> a t-px black border
+    (rectangle is filled on this firmware, so outlines are drawn this way)."""
+    screen.pen = color.black
+    screen.rectangle(x, y, w, h)
+    screen.pen = color.white
+    screen.rectangle(x + t, y + t, w - 2 * t, h - 2 * t)
+
+def _ctext(s, y):
+    """Horizontally-centred rom_font.smart text in black."""
+    screen.font = rom_font.smart
+    w, _ = screen.measure_text(s)
+    screen.pen = color.black
+    screen.text(s, (screen.width - w) // 2, y)
+
 def draw_low_battery(bat_str, volts):
-    """Static, pure black/white warning shown once when the battery is low, then
-    left on the panel (e-ink holds it with no power). No data, centred text."""
+    """Static low-battery warning: a battery glyph with a black 'remaining'
+    sliver and light-grey 'empty' cells, the reading centred inside it, and two
+    lines below. Drawn ONCE when paused, then left on the panel (e-ink holds it).
+    Uses FULL_UPDATE so the panel's native grey renders cleanly (color.grey is
+    the DARK grey; color.smoke is the light one — see §9.15). On battery every
+    wake is a fresh reload, so the mode resets itself next cycle."""
+    try:
+        badge.mode(FULL_UPDATE)      # two native greys need a full update; §9.15
+    except Exception:
+        pass
     screen.pen = color.white
     screen.clear()
+    _outline_rect(42, 46, 170, 68)               # battery body
     screen.pen = color.black
-    screen.font = rom_font.smart
+    screen.rectangle(212, 66, 10, 28)            # terminal nub
+    screen.rectangle(50, 54, 16, 52)             # remaining charge (black sliver)
+    for x, w in ((72, 42), (118, 42), (164, 40)):
+        screen.pen = color.smoke                 # empty capacity (light grey; §9.15)
+        screen.rectangle(x, 54, w, 52)
     detail = bat_str or "low"
     if volts is not None:
         detail = "{}  ({:.2f}V)".format(bat_str or "low", volts)
-    lines = ("LOW BATTERY", "", "Updates paused.",
-             "Plug in USB-C to charge.", "", detail)
-    line_h = 16
-    y = (screen.height - line_h * len(lines)) // 2
-    for ln in lines:
-        if ln:
-            w, _ = screen.measure_text(ln)
-            screen.text(ln, (screen.width - w) // 2, y)
-        y += line_h
+    _ctext(detail, 72)                           # reading, centred in the battery
+    _ctext("LOW BATTERY.", 124)
+    _ctext("Plug in USB-C to charge.", 146)
 
 def arm_and_sleep(mins):
     """Arm the periodic wake then deep-sleep until alarm or button. A silently
