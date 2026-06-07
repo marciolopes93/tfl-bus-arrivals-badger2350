@@ -306,6 +306,10 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   dithering is needed anywhere.
 - **Stale state**: the Line/Destination/Min header row is replaced by
   `Stale - {mins} min ago - press A` (capped at 99). Clears on next success.
+- **Low-battery screen**: a separate full-screen state (not part of the layout
+  above) — centred `LOW BATTERY` / `Updates paused.` / `Plug in USB-C to charge.`
+  plus a `{%}  ({V})` line. Drawn once when paused, then left static; replaces the
+  whole normal UI until charged (§8 / §9.14).
 - **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
   with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
   date** from `london_now()` (a localtime-style tuple `(year, month, mday, hour,
@@ -327,9 +331,18 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   retry (`rtc.clear_alarm()` + `rtc.set_alarm(minutes=REFRESH_MINS)`, retried on
   failure; §5.4 / §9.12); the device deep-sleeps between wakes on battery. A flag
   clear at startup (§5.4) prevents a stale alarm flag wedging the next wake.
-- **AWAKE_MS = 2000.** How long `wait_for_button_or_alarm` stays awake after a
-  draw before deep-sleeping. Short, so most of each cycle is spent asleep (a
-  button still wakes from deep sleep, so the short window costs no responsiveness).
+- **AWAKE_MS = 400.** How long `wait_for_button_or_alarm` stays awake after a
+  draw before deep-sleeping. Kept short on purpose: a button wakes the device from
+  deep sleep anyway, so this window costs no responsiveness, while a long one
+  (it was 2000) is pure radio-on awake-time burned every cycle. After REFRESH_MINS
+  it's the main battery lever — deep sleep itself is ~free (§9.14).
+- **Low-battery pause (`LOW_BATT_VOLTS` / `LOW_BATT_RESUME_VOLTS` /
+  `LOW_POWER_SLEEP_MINS`).** At/below `LOW_BATT_VOLTS` on battery the app latches
+  into a paused "death screen": it draws a static warning once and then stops all
+  WiFi/fetches/refreshes, waking only every `LOW_POWER_SLEEP_MINS` to poll for a
+  charger. It resumes (to a fresh refresh) when charging or once voltage recovers
+  above `LOW_BATT_RESUME_VOLTS`. The pause both preserves the last charge and
+  avoids a brownout-mid-refresh blanking the panel (§9.13 / §9.14).
 - **REQ_TIMEOUT = 8s.** Without a timeout, `requests.get()` can hang for minutes
   when the router is down, freezing the screen. We set `socket.setdefaulttimeout()`
   and pass `timeout=` to `requests.get` (with a `TypeError` fallback for firmware
@@ -435,6 +448,26 @@ The hard-won specifics, so we don't repeat them:
     On-device check confirmed `time_from_ntp()` returns UTC: it read 10:45 when
     London was 11:45 BST. The sync is self-healing — a failed NTP attempt leaves
     the clock unset and retries next refresh.
+14. **Low-battery pause ("death screen").** To stop the device draining its last
+    charge into doomed refreshes (and to avoid the §9.13 brownout-mid-refresh
+    blanking), the app latches into a paused state at/below `LOW_BATT_VOLTS` on
+    battery: it draws a static centred warning ONCE, then skips all WiFi/fetches
+    and does not redraw (e-ink holds the image with no power), waking only every
+    `LOW_POWER_SLEEP_MINS` to poll for a charger. The state is latched in
+    `persist["low_power"]` so it survives the deep-sleep reload — that's what lets
+    "draw once, then stop" work across wakes. Resume is gated with hysteresis
+    (charging, or voltage ≥ `LOW_BATT_RESUME_VOLTS`) so it can't flap at the
+    threshold, and on resume it falls through to a normal fresh refresh. Design
+    notes: thresholds are **voltage**, not `battery_level()` (§9.10); a failed
+    voltage read (`None`) is treated as NOT low (fail-safe — never paints the
+    death screen on a bad ADC read); `is_charging()` drives resume independently
+    of the voltage read, so plugging in always recovers even if the ADC is flaky.
+    The arm/sleep tail was refactored into `arm_and_sleep(mins)` so both the
+    normal (`REFRESH_MINS`) and paused (`LOW_POWER_SLEEP_MINS`) paths share the
+    §9.12 verified-retry arm. **Pending on-device validation:** run the cell down
+    to confirm the warning paints before collapse and that plugging in resumes
+    cleanly; calibrate `LOW_BATT_VOLTS` against the voltage where the badge
+    actually dies (§10).
 
 ---
 
@@ -443,7 +476,9 @@ The hard-won specifics, so we don't repeat them:
 `STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
 `WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`, `RTC_MIN_VALID_YEAR` (the year
 below which the RTC is treated as reset-to-epoch and an NTP re-sync is triggered;
-§5.4 / §9.13).
+§5.4 / §9.13), and the low-battery trio `LOW_BATT_VOLTS` / `LOW_BATT_RESUME_VOLTS`
+/ `LOW_POWER_SLEEP_MINS` (the death-screen enter/resume voltages and paused poll
+interval; §8 / §9.14).
 
 Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
 voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
@@ -482,9 +517,10 @@ the voltage where the badge actually dies, and set that as the `0%` point.
 - Now that fonts support UTF-8, optionally show a real `°` instead of `C`.
 - Split `WEATHER_MAX_STALE_MINS` into separate refresh-interval vs stale-threshold
   knobs if more-frequent healthy weather refresh is wanted.
-- Optional low-battery threshold behaviour (currently only the meter is shown).
-  Now that % comes from voltage, a warning could trigger off a voltage cutoff
-  (e.g. < 3.5 V) rather than the unreliable `battery_level()`.
+- **DONE — low-battery pause behaviour (§8 / §9.14).** Implemented as a latched
+  "death screen": at/below `LOW_BATT_VOLTS` on battery the app draws a static
+  warning once and stops all work until charged. Triggers off a voltage threshold
+  (reliable, unlike `battery_level()`), per the idea noted here previously.
 - Optional: register a TFL app key if usage ever scales.
 
 ### 12.1 Proposed cleaner wake mechanism: `badge.sleep()` (deferred)
