@@ -17,6 +17,10 @@ os.chdir("/system/apps/tfl")
 
 try:
     rtc.rtc_to_localtime()   # keep time.localtime() correct after a sleep; §5.4
+    rtc.clear_alarm()        # clear any stale/latched alarm flag from the prior
+                             # wake before a fresh one is armed below. A latched
+                             # flag is a candidate for "alarm won't re-fire" wedges
+                             # over many cycles (reliability fix).
 except Exception:
     pass
 
@@ -398,13 +402,26 @@ def update():
     if should_refresh:
         badge.update()
 
-    # Arm the periodic wake (keyword form like the stock apps; §5.4)
-    try:
-        rtc.set_alarm(minutes=REFRESH_MINS)
-    except Exception:
-        pass
+    # Arm the periodic wake (keyword form like the stock apps; §5.4). A silently
+    # swallowed set_alarm() failure here was the cause of the ~48h deep-sleep
+    # freeze: the device slept with no wake source and stayed dark until reset.
+    # Retry on failure instead of `except: pass`, clear any stale flag first, and
+    # only deep-sleep once an alarm is actually armed.
+    armed = False
+    for _ in range(3):
+        try:
+            rtc.clear_alarm()
+            rtc.set_alarm(minutes=REFRESH_MINS)
+            armed = True
+            break
+        except Exception:
+            time.sleep(0.2)
 
-    wait_for_button_or_alarm(timeout=AWAKE_MS)
+    if armed:
+        wait_for_button_or_alarm(timeout=AWAKE_MS)
+    # else: arming failed all retries — do NOT deep-sleep with no wake source.
+    # Return so run() calls update() again and we retry, rather than freezing
+    # until a manual reset. (Worst case is a busy retry loop, not a brick.)
 
 def on_exit():
     try:
