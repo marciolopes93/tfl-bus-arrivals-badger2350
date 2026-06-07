@@ -243,10 +243,17 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 `color.light_grey`.**
 
 - `color.black` / `color.white` are pure black/white on Badger.
-- A flat grey fill **thresholds to solid black** on the e-ink unless you dither.
-  To show a real grey, use `screen.dither()` (whole-frame) or
-  `badge.mode(... | DITHER)`. *(We removed our only grey — see §7 — so the app is
-  now pure black/white and needs no dithering.)*
+- **The panel has two real greys** (black + 2 greys + white = 4 levels; §9.15).
+  Any pen is *quantized* to the nearest of those four. `color.grey` is the **dark**
+  grey; `color.smoke` (and ~`color.rgb(160-190,...)`) land on the **light** grey.
+  Grey renders cleanly only under a non-fast update — we draw greys under
+  `badge.mode(FULL_UPDATE)`. A fast update muddies/darkens them, which (together
+  with the long-gone v4 `color.light_grey`) is why the early zebra rows and first
+  grey-bar tests came out near-black. See §9.15.
+- Dithering (`screen.dither()` / `badge.mode(... | DITHER)`) is only needed for
+  *extra* shades beyond the two native greys — not required for a single light grey.
+- Used in the low-battery screen (light-grey "empty" cells; §7 / §9.14). The main
+  bus UI stays pure black/white.
 
 ### 5.9 Fonts
 `rom_font.<name>` (injected). Available ROM pixel fonts include: `ark`, `compass`,
@@ -307,9 +314,11 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 - **Stale state**: the Line/Destination/Min header row is replaced by
   `Stale - {mins} min ago - press A` (capped at 99). Clears on next success.
 - **Low-battery screen**: a separate full-screen state (not part of the layout
-  above) — centred `LOW BATTERY` / `Updates paused.` / `Plug in USB-C to charge.`
-  plus a `{%}  ({V})` line. Drawn once when paused, then left static; replaces the
-  whole normal UI until charged (§8 / §9.14).
+  above) — a battery glyph (outline body + nub) with a black "remaining" sliver
+  at the left and light-grey "empty" cells (`color.smoke`, drawn under
+  `FULL_UPDATE`; §9.15), the `{%}  ({V})` reading centred inside it, then
+  `LOW BATTERY.` and `Plug in USB-C to charge.` below. Drawn once when paused,
+  then left static; replaces the whole normal UI until charged (§8 / §9.14).
 - **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
   with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
   date** from `london_now()` (a localtime-style tuple `(year, month, mday, hour,
@@ -467,7 +476,33 @@ The hard-won specifics, so we don't repeat them:
     §9.12 verified-retry arm. **Pending on-device validation:** run the cell down
     to confirm the warning paints before collapse and that plugging in resumes
     cleanly; calibrate `LOW_BATT_VOLTS` against the voltage where the badge
-    actually dies (§10).
+    actually dies (§10). **Visual:** the screen is a battery glyph — outline body
+    + nub, a black "remaining" sliver, light-grey "empty" cells, the reading
+    centred inside, `LOW BATTERY.` / `Plug in USB-C to charge.` below. The grey
+    cells use `color.smoke` under `FULL_UPDATE` (§9.15); `draw_low_battery()` sets
+    that mode itself. Safe because this screen only paints on battery, where every
+    wake is a fresh reload that resets the mode — the main UI keeps the fast default.
+15. **The panel has two native greys — earlier "grey = black" was wrong cause.**
+    When adding grey bars to the low-battery screen, `color.grey` and every
+    `badge.mode()` / dither combination we tried came out near-black, seemingly
+    confirming §5.8's old "grey thresholds to black." Reading the official
+    Badgeware docs corrected this: the Badger displays **black, white and two
+    greys** (4 levels), and any pen is *quantized* to the nearest level; update
+    speed affects how greys render. Two things had compounded: (a) `color.grey`
+    is the **dark** grey in DawnBringer-16, so it quantized to the dark level (or
+    black under a fast update) — the light grey is `color.smoke`, or
+    `color.rgb(160–190, …)` (all three looked identical on-device); and (b) the
+    app's default fast update muddies greys, so they only render cleanly under
+    `MEDIUM_UPDATE`/`FULL_UPDATE`. The original v1.0.0 zebra grey worked because it
+    used v4's `color.light_grey`, which the v2.x migration deleted (§9.7 / §13) —
+    so that good grey was never reproducible by name under v2.x. Fix: draw the
+    low-battery grey cells with `color.smoke` under `badge.mode(FULL_UPDATE)`. No
+    self-dithering needed (a dither only buys *extra* shades beyond the two native
+    greys). Verified on-device via a swatch test (`grey`/`taupe`/`smoke`/`latte`
+    plus `rgb(120/160/190/220)`): `smoke` ≈ `rgb160` ≈ `rgb190` gave the wanted
+    light grey. Lesson reinforced (§9.11): the device + the *official* source beat
+    a guessed pile of modes — should have read the colour docs before chasing
+    `mode()` flags.
 
 ---
 
@@ -483,6 +518,11 @@ interval; §8 / §9.14).
 Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
 voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
 the voltage where the badge actually dies, and set that as the `0%` point.
+
+The low-battery screen's grey is `color.smoke` drawn under `badge.mode(FULL_UPDATE)`
+(both set inside `draw_low_battery()`; §9.15). To restyle it, swap the pen
+(`color.rgb(160–190, …)` is equivalent) — but keep a non-fast update or the grey
+darkens.
 
 ---
 
@@ -520,7 +560,9 @@ the voltage where the badge actually dies, and set that as the `0%` point.
 - **DONE — low-battery pause behaviour (§8 / §9.14).** Implemented as a latched
   "death screen": at/below `LOW_BATT_VOLTS` on battery the app draws a static
   warning once and stops all work until charged. Triggers off a voltage threshold
-  (reliable, unlike `battery_level()`), per the idea noted here previously.
+  (reliable, unlike `battery_level()`), per the idea noted here previously. The
+  screen is a battery glyph with a black "remaining" sliver, light-grey "empty"
+  cells (`color.smoke` under `FULL_UPDATE`; §9.15) and the reading centred inside.
 - Optional: register a TFL app key if usage ever scales.
 
 ### 12.1 Proposed cleaner wake mechanism: `badge.sleep()` (deferred)
