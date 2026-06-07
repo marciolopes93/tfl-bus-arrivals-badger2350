@@ -32,10 +32,23 @@ MAX_BUSES = 6
 REFRESH_MINS = 2
 WEATHER_MAX_STALE_MINS = 60
 WEATHER_LOCATION = "Westminster"
-AWAKE_MS = 2000   # was 5000; lowered to cut awake time. A button still wakes the
-                  # device from deep sleep, so a short window costs no responsiveness.
+AWAKE_MS = 400    # awake window before deep sleep. Short: a button wakes from
+                  # deep sleep anyway, so this costs no responsiveness but trims
+                  # the (radio-on) awake tail off every cycle — the main battery
+                  # lever after REFRESH_MINS (see HANDOFF §8).
 RTC_MIN_VALID_YEAR = 2024   # below this the RTC has reset to its 2000 epoch
                             # (after a full battery death) -> trigger an NTP re-sync.
+
+# Low-battery "death screen": at/below LOW_BATT_VOLTS (and not charging) the app
+# latches into a paused state — draws a static warning ONCE and stops all WiFi /
+# fetches / refreshes, sleeping rarely just to poll for a charger. This both saves
+# the last charge and avoids a brownout-mid-refresh blanking the panel (§9.14).
+# Voltage thresholds (not %): more reliable, per HANDOFF §5.6/§10. Calibrate the
+# same way as _LIPO_CURVE — note the volts where the cell actually dies.
+LOW_BATT_VOLTS        = 3.45   # enter paused mode at/below this (~7-8% on the curve)
+LOW_BATT_RESUME_VOLTS = 3.60   # hysteresis: auto-resume only above this (or when
+                               # charging) so it can't flap at the threshold
+LOW_POWER_SLEEP_MINS  = 15     # while paused, wake this rarely to poll for charge
 
 TFL_URL     = "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(STOP_ID)
 WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
@@ -61,6 +74,7 @@ persist = {
     "last_ok_at": None,
     "weather_at": None,
     "weather_try_at": None,
+    "low_power":  False,   # latched low-battery pause state; survives the reload
 }
 State.load("tfl", persist)
 
@@ -107,19 +121,29 @@ def _pct_from_voltage(v):
             return int(p0 + (p1 - p0) * (v - v0) / (v1 - v0))
     return 100
 
-def battery_text():
-    """Header meter string: 'chg' while charging, else a voltage-derived %.
-    Read this BEFORE WiFi comes up — the ADC can read low while the radio is
-    active on RP2350 boards."""
+def read_battery():
+    """(charging, volts) read in one go. Call BEFORE WiFi comes up — the ADC can
+    read low while the radio is active on RP2350 boards. `volts` is None if the
+    read fails (we then never treat the battery as low — fail safe, §9.14)."""
+    charging = False
     try:
-        if badge.is_charging():
-            return "chg"
+        charging = badge.is_charging()
     except Exception:
         pass
+    volts = None
     try:
-        return "{}%".format(_pct_from_voltage(badge.battery_voltage()))
+        volts = badge.battery_voltage()
     except Exception:
+        pass
+    return charging, volts
+
+def battery_str_from(charging, volts):
+    """Header meter string: 'chg' while charging, else a voltage-derived %."""
+    if charging:
+        return "chg"
+    if volts is None:
         return ""
+    return "{}%".format(_pct_from_voltage(volts))
 
 # ---- Clock / timezone ------------------------------------------------------
 # The RTC keeps time off the LiPo through deep sleep, but a FULL battery death
@@ -364,8 +388,70 @@ def weather_fresh():
 # No init(): the module reload on each battery wake already resets the globals
 # above, so it's redundant (the stock apps omit init() too).
 
+def draw_low_battery(bat_str, volts):
+    """Static, pure black/white warning shown once when the battery is low, then
+    left on the panel (e-ink holds it with no power). No data, centred text."""
+    screen.pen = color.white
+    screen.clear()
+    screen.pen = color.black
+    screen.font = rom_font.smart
+    detail = bat_str or "low"
+    if volts is not None:
+        detail = "{}  ({:.2f}V)".format(bat_str or "low", volts)
+    lines = ("LOW BATTERY", "", "Updates paused.",
+             "Plug in USB-C to charge.", "", detail)
+    line_h = 16
+    y = (screen.height - line_h * len(lines)) // 2
+    for ln in lines:
+        if ln:
+            w, _ = screen.measure_text(ln)
+            screen.text(ln, (screen.width - w) // 2, y)
+        y += line_h
+
+def arm_and_sleep(mins):
+    """Arm the periodic wake then deep-sleep until alarm or button. A silently
+    swallowed set_alarm() failure here caused the ~48h freeze (slept with no wake
+    source); retry instead of `except: pass`, clear any stale flag first, and only
+    sleep once an alarm is actually armed (§5.4 / §9.12). If all retries fail we
+    return so run() re-calls update() rather than freezing — busy retry, not brick."""
+    armed = False
+    for _ in range(3):
+        try:
+            rtc.clear_alarm()
+            rtc.set_alarm(minutes=mins)
+            armed = True
+            break
+        except Exception:
+            time.sleep(0.2)
+    if armed:
+        wait_for_button_or_alarm(timeout=AWAKE_MS)
+
 def update():
     global initialised, last_refresh_minute
+
+    charging, volts = read_battery()    # BEFORE WiFi comes up (ADC skew); §5.6
+    bat_str = battery_str_from(charging, volts)
+
+    # ---- Low-battery gate: pause everything behind a static warning (§9.14) ----
+    # Latched in persist["low_power"] so it survives the deep-sleep reload. On
+    # entry we draw the warning ONCE and stop; while paused we don't redraw (the
+    # panel holds the image) and skip all WiFi/fetches, waking rarely just to poll
+    # for a charger. Resume only when charging or recovered above the hysteresis
+    # threshold — then fall through to a normal, fresh refresh + draw.
+    if persist.get("low_power"):
+        if charging or (volts is not None and volts >= LOW_BATT_RESUME_VOLTS):
+            persist["low_power"] = False
+            save_state()
+        else:
+            arm_and_sleep(LOW_POWER_SLEEP_MINS)   # stay paused; no redraw
+            return
+    elif (not charging) and (volts is not None) and (volts <= LOW_BATT_VOLTS):
+        draw_low_battery(bat_str, volts)
+        badge.update()
+        persist["low_power"] = True
+        save_state()
+        arm_and_sleep(LOW_POWER_SLEEP_MINS)
+        return
 
     t = rtc.datetime()
     current_minute = t[3] * 60 + t[4]
@@ -385,8 +471,6 @@ def update():
     if _button_a_down():                # manual: also forces a weather fetch
         should_refresh = True
         manual = True
-
-    bat_str = battery_text()            # read BEFORE WiFi comes up (see helper)
 
     if should_refresh:
         do_refresh(force_weather=manual)
@@ -462,26 +546,7 @@ def update():
     if should_refresh:
         badge.update()
 
-    # Arm the periodic wake (keyword form like the stock apps; §5.4). A silently
-    # swallowed set_alarm() failure here was the cause of the ~48h deep-sleep
-    # freeze: the device slept with no wake source and stayed dark until reset.
-    # Retry on failure instead of `except: pass`, clear any stale flag first, and
-    # only deep-sleep once an alarm is actually armed.
-    armed = False
-    for _ in range(3):
-        try:
-            rtc.clear_alarm()
-            rtc.set_alarm(minutes=REFRESH_MINS)
-            armed = True
-            break
-        except Exception:
-            time.sleep(0.2)
-
-    if armed:
-        wait_for_button_or_alarm(timeout=AWAKE_MS)
-    # else: arming failed all retries — do NOT deep-sleep with no wake source.
-    # Return so run() calls update() again and we retry, rather than freezing
-    # until a manual reset. (Worst case is a busy retry loop, not a brick.)
+    arm_and_sleep(REFRESH_MINS)   # verified-retry arm + deep sleep (§5.4 / §9.12)
 
 def on_exit():
     try:
