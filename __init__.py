@@ -146,58 +146,31 @@ def battery_str_from(charging, volts):
     return "{}%".format(_pct_from_voltage(volts))
 
 # ---- Clock / timezone ------------------------------------------------------
-# The RTC keeps time off the LiPo through deep sleep, but a FULL battery death
-# wipes it back to its 2000-01-01 epoch (the device does NOT self-sync from the
-# net; see HANDOFF §9.13). We re-sync via rtc.time_from_ntp() — but NTP is UTC and
-# this firmware has no set_datetime() (only set_alarm/set_timer; confirmed by
-# dir(rtc)), so we keep the RTC on UTC and apply the UK offset only at DISPLAY
-# time. All internal timing (staleness, last_ok, the alarm delay) stays UTC —
-# it's all relative/differences, so it needs no conversion.
-
-def _dow(y, mo, d):
-    """Day-of-week 0=Mon..6=Sun for a date (matches rtc.datetime()[6])."""
-    return time.localtime(time.mktime((y, mo, d, 12, 0, 0, 0, 0)))[6]
-
-def _last_sunday(y, mo):
-    """Date of the last Sunday in a month (always >= 25 for Mar/Oct)."""
-    for d in range(31, 24, -1):
-        try:
-            if _dow(y, mo, d) == 6:
-                return d
-        except Exception:
-            pass
-    return 25
-
-def _uk_is_bst(y, mo, d, hh):
-    """True if the UK is on BST (UTC+1) at the given UTC datetime. BST runs from
-    01:00 UTC on the last Sunday of March to 01:00 UTC on the last Sunday of Oct."""
-    if mo < 3 or mo > 10:
-        return False
-    if 3 < mo < 10:
-        return True
-    ls = _last_sunday(y, mo)
-    if mo == 3:
-        return d > ls or (d == ls and hh >= 1)
-    return d < ls or (d == ls and hh < 1)   # October
+# The RTC runs on UK LOCAL time (confirmed on-device: rtc.datetime() reads the
+# wall clock, not UTC), and keeps it off the LiPo through deep sleep. So we just
+# display time.localtime() — NO display-time offset (an earlier BST offset here
+# double-counted the hour in summer; §9.16). A FULL battery death still wipes the
+# RTC to its 2000 epoch; sync_clock_if_needed() re-seeds it (see its note + §9.16
+# for the one caveat that leaves).
 
 def london_now():
-    """Current London wall-clock as a localtime-style tuple: the UTC system clock
-    plus the BST/GMT offset. Used only for the header clock + footer date."""
-    t = time.localtime()                     # UTC (RTC is kept on UTC)
-    if _uk_is_bst(t[0], t[1], t[2], t[3]):
-        return time.localtime(time.mktime(t) + 3600)
-    return t
+    """UK wall-clock as a localtime-style tuple. The RTC is already on local time,
+    so this is just time.localtime() — kept as a named seam in case a future
+    timezone change ever needs a single place to adjust (§9.16)."""
+    return time.localtime()
 
 def sync_clock_if_needed():
     """No-op unless the RTC looks unset (year < RTC_MIN_VALID_YEAR), i.e. after a
-    battery death. Then re-sync from NTP (UTC) and mirror into the system clock.
+    battery death. Then re-seed it from NTP and mirror into the system clock.
     Self-healing: a failed NTP attempt leaves the clock unset and retries next
-    refresh, so it catches up on its own once the network is reachable."""
+    refresh. CAVEAT: time_from_ntp() returns UTC and there's no setter to write a
+    corrected local value, so a death recovered during BST reads 1h behind until
+    fixed — rare, and far better than staying stuck at the 2000 epoch (§9.16)."""
     try:
         if rtc.datetime()[0] >= RTC_MIN_VALID_YEAR:
             return
-        rtc.time_from_ntp()      # sets the RTC to UTC
-        rtc.rtc_to_localtime()   # mirror UTC into time.localtime()
+        rtc.time_from_ntp()      # seeds the RTC (UTC; see caveat above)
+        rtc.rtc_to_localtime()   # mirror into time.localtime()
     except Exception:
         pass
 
