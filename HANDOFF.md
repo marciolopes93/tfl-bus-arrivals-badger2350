@@ -190,12 +190,18 @@ State.save("tfl", persist)   # save after changes
   **UTC**. We only call it when the RTC looks unset (`datetime()[0] < RTC_MIN_VALID_YEAR`),
   i.e. after a full battery death wiped it to the 2000 epoch (§9.13). Needs WiFi
   up first (a bare-REPL call with no connection raises `OSError -6` from inside
-  `ntptime.py`). **No `set_datetime()` exists on this firmware** — `dir(rtc)`
-  shows only `set_alarm`/`set_timer` as setters — so we cannot write a corrected
-  local time into the RTC. We keep the RTC on UTC and apply the UK BST/GMT offset
-  only at **display** time via `london_now()` (§5.7 / §9.13). Internal timing
-  (staleness, `last_ok_at`, the alarm delay) stays UTC; it's all relative, so it
-  needs no conversion.
+  `ntptime.py`).
+- **The RTC normally runs on UK LOCAL time, not UTC.** Confirmed on-device:
+  `rtc.datetime()` reads the wall clock (e.g. 23:20 when London is 23:20 BST), and
+  the original app displayed `time.localtime()` straight and was correct for
+  months. So the display applies **no** timezone offset — `london_now()` is just
+  `time.localtime()`. An earlier version of this doc/code wrongly assumed the RTC
+  was UTC and added a BST offset at display time; that double-counted the hour in
+  summer (§9.16). **Caveat — the one place UTC leaks in:** `time_from_ntp()`
+  returns UTC, and there's **no `set_datetime()`** on this firmware (`dir(rtc)`
+  shows only `set_alarm`/`set_timer` as setters), so the death-recovery re-seed
+  (§9.13) leaves the RTC on UTC — correct in winter, 1h behind during BST until
+  manually fixed. Open item in §9.16 / §12.
 
 ### 5.5 Buttons (`badge`)
 `io` is gone — it's now `badge`. Test a button with `badge.pressed(BUTTON_A)`
@@ -305,8 +311,8 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   The meter shows a voltage-derived `%` on battery, or `"chg"` while charging
   (see §5.6 / §9.10 — `battery_level()` is unusable, so we map `battery_voltage()`
   through a LiPo curve). Just the meter, no "LOW" text. The clock and footer date
-  are drawn from `london_now()`, not raw `time.localtime()`: the RTC is kept on
-  UTC and the UK BST/GMT offset is applied at display time only (§5.4 / §9.13).
+  are drawn from `london_now()`, which on this firmware is simply `time.localtime()`
+  — the RTC already runs on UK local time, so no offset is applied (§5.4 / §9.16).
 - **Bus rows are now plain black text on white** — the old zebra/alternating-row
   shading was removed (it relied on a grey that the e-ink rendered as solid black;
   see §9). The display is clean without it, and being pure black/white means no
@@ -449,14 +455,13 @@ The hard-won specifics, so we don't repeat them:
     `rtc.rtc_to_localtime()` (RTC→system copy), never a fetch. Fix: call
     `rtc.time_from_ntp()` (the unused method from §5.4) once WiFi is up, gated on
     the RTC year looking unset (`< RTC_MIN_VALID_YEAR`) so normal deep-sleep wakes
-    skip it. NTP returns **UTC** and there's no `set_datetime()` to write a
-    corrected local value back (only `set_alarm`/`set_timer`; confirmed via
-    `dir(rtc)`), so the RTC stays UTC and the UK offset is applied at display time
-    only — `london_now()` adds +1h during BST via a computed last-Sunday rule
-    (no table, no hard-coded month), verified at the spring/autumn boundary hours.
-    On-device check confirmed `time_from_ntp()` returns UTC: it read 10:45 when
-    London was 11:45 BST. The sync is self-healing — a failed NTP attempt leaves
-    the clock unset and retries next refresh.
+    skip it. The sync is self-healing — a failed NTP attempt leaves the clock unset
+    and retries next refresh. **Correction (see §9.16):** an earlier version of this
+    entry concluded the RTC should be kept on UTC with a BST offset applied at
+    display time. That was wrong — the RTC normally runs on **local** time, so the
+    display must NOT offset. The remaining wrinkle is only here in recovery:
+    `time_from_ntp()` seeds **UTC** and there's no setter to write a corrected local
+    value, so a death recovered during BST reads 1h behind until fixed (§9.16 / §12).
 14. **Low-battery pause ("death screen").** To stop the device draining its last
     charge into doomed refreshes (and to avoid the §9.13 brownout-mid-refresh
     blanking), the app latches into a paused state at/below `LOW_BATT_VOLTS` on
@@ -503,6 +508,27 @@ The hard-won specifics, so we don't repeat them:
     light grey. Lesson reinforced (§9.11): the device + the *official* source beat
     a guessed pile of modes — should have read the colour docs before chasing
     `mode()` flags.
+16. **Clock showed +1h in summer — the display BST offset was a regression.**
+    Symptom: header read `Mon 00:13` when it was really `Sun 23:13` BST. Cause: the
+    §9.13 clock work assumed the RTC was UTC and added a UK BST offset at display
+    time (`london_now()` + a last-Sunday BST rule). But the RTC actually runs on
+    **local** time — confirmed on-device: `rtc.datetime()` → `(2026, 6, 7, 23, 20,
+    21, 6)` while London was 23:20, and the original app displayed `time.localtime()`
+    straight and was right for months. So the offset double-counted the hour
+    whenever the UK is on BST. Fix: drop the offset entirely — `london_now()` is now
+    just `time.localtime()`, and the `_dow`/`_last_sunday`/`_uk_is_bst` helpers were
+    deleted (recoverable from git history if ever needed). The mistaken assumption
+    came from the §9.13 NTP test, which only showed what `time_from_ntp()` *returns*
+    (UTC), not what the RTC normally *holds* (local). Lesson (again, §9.11): read
+    the actual RTC value before designing around it.
+    **Still open — death-recovery during BST (§5.4 / §12):** because `time_from_ntp()`
+    seeds UTC and there's no `set_datetime()` to write local back, a full battery
+    death recovered in summer leaves the clock 1h behind until corrected (winter is
+    fine; UTC == local). Not yet fixed — it needs a tested way to write a
+    BST-corrected local time into the RTC (candidate: `localtime_to_rtc()` after
+    nudging the system clock +1h; unverified on this firmware, so not attempted).
+    Low impact: only triggers on a full death in BST, and the date/approx-time is
+    still far better than staying stuck at the 2000 epoch.
 
 ---
 
@@ -564,6 +590,10 @@ darkens.
   screen is a battery glyph with a black "remaining" sliver, light-grey "empty"
   cells (`color.smoke` under `FULL_UPDATE`; §9.15) and the reading centred inside.
 - Optional: register a TFL app key if usage ever scales.
+- **Death-recovery clock during BST reads 1h behind (§9.16).** `time_from_ntp()`
+  seeds UTC and there's no `set_datetime()` to write local back. Low impact (only
+  after a full battery death, in summer). Fix would need a tested local-write path
+  (candidate: `localtime_to_rtc()` after a +1h nudge) — verify on-device first.
 
 ### 12.1 Proposed cleaner wake mechanism: `badge.sleep()` (deferred)
 
