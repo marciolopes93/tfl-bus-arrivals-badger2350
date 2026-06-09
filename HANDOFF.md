@@ -8,6 +8,11 @@ Badger 2350. **Read this first before making changes.**
 > started on. Everything below describes v2.x. The old v4 details have been moved
 > to **§13 Legacy** and are no longer used — don't write new code against them.
 
+> **Published-repo note:** `README.md` and the `docs/` folder are the curated,
+> user-facing entry points (install, configuration, troubleshooting, firmware
+> field notes). This file is the full development log and design source of
+> truth; code comments cross-reference it by `§` section.
+
 ---
 
 ## 1. Project goal
@@ -295,7 +300,7 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 
 ```
 +------------------------------------------------------------+
-| 84%   TFL  Abbey Road                               08:47  |  <- header bar (black bg, white text)
+| 84%   TFL  Abbey Road                        08:47  |  <- header bar (black bg, white text)
 |------------------------------------------------------------|
 | Line   Destination                              Min        |  <- col headers (y=22)
 | ---------------------------------------------------------- |  <- separator line (y=36)
@@ -325,6 +330,13 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   `FULL_UPDATE`; §9.15), the `{%}  ({V})` reading centred inside it, then
   `LOW BATTERY.` and `Plug in USB-C to charge.` below. Drawn once when paused,
   then left static; replaces the whole normal UI until charged (§8 / §9.14).
+- **Quiet-hours screen** (§8 / §9.17): between `QUIET_START` and `QUIET_END` the
+  bus table is replaced by a parked notice — the live header (battery/clock) and
+  the weather footer around a centred message: `Buses are still running - /
+  I'm asleep to conserve battery.` (one sentence wrapped over two lines — too
+  wide for the panel in one), then a gap, `Auto-updates resume at 05:30.`
+  (rendered from `QUIET_END`), a gap, and `Press A for an update now.`
+  Repainted once per `QUIET_SLEEP_MINS` heartbeat, not per wake.
 - **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
   with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
   date** from `london_now()` (a localtime-style tuple `(year, month, mday, hour,
@@ -351,6 +363,17 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   deep sleep anyway, so this window costs no responsiveness, while a long one
   (it was 2000) is pure radio-on awake-time burned every cycle. After REFRESH_MINS
   it's the main battery lever — deep sleep itself is ~free (§9.14).
+- **Quiet hours (`QUIET_START`/`QUIET_END`, default 22:30–05:30; §9.17).** Inside
+  the window the app parks: no bus fetching, no 2-minute wakes. It wakes once per
+  `QUIET_SLEEP_MINS` (60) for a heartbeat — weather-only fetch if due, repaint of
+  the quiet screen's header clock/battery and footer — and sleeps in chunks
+  capped at the minutes remaining to `QUIET_END`, so the first normal refresh
+  lands on time. **Press A** for `QUIET_OVERRIDE_MINS` (30) of normal live
+  updates, after which it parks again if still inside the window. Disable by
+  setting either bound to `None`. Skipped entirely while the RTC looks unset
+  (`clock_valid()`; §9.13) so a post-death 00:00 epoch clock can't trap the
+  device asleep — the normal path then runs and the NTP self-heal fixes the
+  clock. ~28 fetch cycles a night replaced by ~7 heartbeats.
 - **Low-battery pause (`LOW_BATT_VOLTS` / `LOW_BATT_RESUME_VOLTS` /
   `LOW_POWER_SLEEP_MINS`).** At/below `LOW_BATT_VOLTS` on battery the app latches
   into a paused "death screen": it draws a static warning once and then stops all
@@ -373,6 +396,16 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   `fetch_weather()` stamps `weather_try_at` and saves on every path so the backoff
   survives the deep-sleep reload. Weather failures are silent and never block the
   bus fetch. **Press A always force-fetches weather** (`do_refresh(force_weather=True)`).
+- **Weather retry burst (`WEATHER_RETRY_BURST = 3`).** When a due (hourly)
+  weather fetch fails, the next `WEATHER_RETRY_BURST` wakes each retry it
+  (alongside the bus fetch, 2 min apart) before giving up — so a blip doesn't
+  cost the footer for an hour. The footer is **held on screen through the
+  burst** (`weather_fresh()` honours it) and only drops once the burst is
+  exhausted without a success; attempts then return to hourly. Driven by a
+  persisted consecutive-failure counter (`weather_fails`, reset on any success,
+  capped at 99 so it can't grow unbounded). Nuance: during quiet hours wakes are
+  hourly, so a burst there spreads across hours — harmless, but it means the
+  footer can linger a few hours longer overnight during a wttr.in outage.
 
 ---
 
@@ -529,17 +562,68 @@ The hard-won specifics, so we don't repeat them:
     nudging the system clock +1h; unverified on this firmware, so not attempted).
     Low impact: only triggers on a full death in BST, and the date/approx-time is
     still far better than staying stuck at the 2000 epoch.
+17. **Quiet hours (overnight pause) — design decisions.** Implemented per §8;
+    the non-obvious choices, for when this needs touching:
+    - **Gate order:** low battery first (safety wins), then quiet hours, then the
+      normal refresh path.
+    - **Override latch:** persisted as `persist["quiet_override_at"]` ("HH:MM" of
+      the A press) because every battery wake is a fresh reload (§5.3). It is
+      explicitly cleared both on expiry and whenever a wake lands *outside* the
+      window — otherwise, since `minutes_since()` wraps at 24h, a stale stamp
+      from last night would read as recent at the same time tomorrow night and
+      spuriously re-trigger the override.
+    - **Button across deep sleep:** a quick tap that wakes the device can be
+      released before the reloaded module's first `badge.pressed()` poll, so the
+      override trigger is `badge.pressed(BUTTON_A) or badge.woken_by_button()`.
+      **`woken_by_button()` is UNVERIFIED in this role** — if it ever reports
+      True on *alarm* wakes, the override re-arms every wake and never expires
+      (quiet hours silently defeated). Validation item in §12; the fallback is
+      to drop it from the OR and accept that a quick tap may need a second press.
+    - **Chunked sleeps, not one long alarm:** 60-min `set_alarm` chunks rather
+      than a single alarm to `QUIET_END` — multi-hour alarms are unexercised on
+      this firmware (§9.11), a single failed long arm is the §9.12 failure mode
+      writ large, and the chunks provide the hourly heartbeat for free. Each
+      chunk is `min(QUIET_SLEEP_MINS, mins_until_quiet_end())` so the wake at
+      the window's end is exact.
+    - **USB:** the loop spins instead of deep-sleeping (§5.3), so the heartbeat
+      repaint/fetch is gated by `last_quiet_draw_minute` — a plain global that
+      persists on USB but resets to -1 on every battery wake, which is what
+      makes each battery heartbeat repaint unconditionally. It's also reset to
+      -1 when the override expires so the quiet screen repaints over the
+      override's bus table on USB.
+    - **Heartbeat weather fetch** goes direct (`connect_wifi()` +
+      `fetch_weather()`), not via `do_refresh()` — no bus fetch, no stale/error
+      state changes overnight. The socket default timeout is therefore now also
+      set once at module load, since this path skips `do_refresh()`'s.
+    **Validated on-device (USB, Thonny):** the parked screen draws once and
+    holds (no redraw loop on the spinning USB loop); a press of A enters the
+    override (live table, `persist["quiet_override_at"]` stamped) and it expires
+    cleanly back to the parked screen (latch cleared to None); the normal
+    daytime table is unaffected; `woken_by_button` exists on `badge` and reads
+    False in a USB session; the window math passes its checks on the device's
+    MicroPython. **Still pending — battery only (§12):** `woken_by_button()`
+    semantics on alarm vs button wakes; a 60-minute `set_alarm` chunk firing;
+    one full unattended night.
 
 ---
 
 ## 10. Config knobs (top of `__init__.py`)
 
 `STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
-`WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`, `RTC_MIN_VALID_YEAR` (the year
+`WEATHER_RETRY_BURST` (extra per-wake retries after a failed hourly weather
+fetch before the footer drops; §8), `WEATHER_LOCATION`, `AWAKE_MS`, `REQ_TIMEOUT`,
+`RTC_MIN_VALID_YEAR` (the year
 below which the RTC is treated as reset-to-epoch and an NTP re-sync is triggered;
-§5.4 / §9.13), and the low-battery trio `LOW_BATT_VOLTS` / `LOW_BATT_RESUME_VOLTS`
+§5.4 / §9.13), the low-battery trio `LOW_BATT_VOLTS` / `LOW_BATT_RESUME_VOLTS`
 / `LOW_POWER_SLEEP_MINS` (the death-screen enter/resume voltages and paused poll
-interval; §8 / §9.14).
+interval; §8 / §9.14), and the quiet-hours quartet `QUIET_START` / `QUIET_END`
+("HH:MM" strings; set either to `None` to disable) / `QUIET_SLEEP_MINS`
+(heartbeat + chunk length) / `QUIET_OVERRIDE_MINS` (press-A live window; §8 /
+§9.17).
+
+Also tweakable in code (not config-block constants): destination names truncate
+at 23 characters in `fetch_arrivals()` (`[:22] + "~"`; widened from 20), and the
+footer's left label at 28.
 
 Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
 voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
@@ -576,6 +660,22 @@ darkens.
   mark where it previously froze. The USB dev session never deep-sleeps, so this
   alarm-wake path is still the lightly-exercised one — leave it on battery to
   exercise it (the ~31% reading at the last freeze leaves ample runway to test).
+- **Validate quiet hours on battery (§9.17).** USB-side behaviour is verified
+  (parked screen draw-once-and-hold, press-A override entry and expiry, daytime
+  table unaffected). Three battery checks remain: (a) `badge.woken_by_button()`
+  reads False on alarm wakes and True on button wakes
+  (if it misreports, the press-A override never expires — drop it from the
+  trigger OR as the fallback); (b) a 60-minute `rtc.set_alarm` chunk actually
+  fires (only ≤2-min alarms are battle-tested so far); (c) one full unattended
+  night, confirming the parked screen holds, the hourly heartbeat repaints, and
+  live updates resume at `QUIET_END`.
+- **Outage backoff (future release).** During a WiFi outage every 2-min wake
+  burns ~10 s of radio in `connect_wifi()` — the most expensive failure mode
+  left. Persist a consecutive-failure counter and stretch the sleep (e.g. 5 then
+  10 min) until a fetch succeeds; clears on reconnection.
+- **`wlan.active(False)` before sleeping (future release).** Probably moot —
+  deep sleep should power the radio down anyway — but it's a one-line REPL check
+  (compare sleep current with/without) and a one-line add if it helps.
 - If battery life needs work, consider `badge.mode(...)` tuning.
 - **Migrate the periodic wake to `badge.sleep()` (the cleaner fix).** Detailed
   proposal in **§12.1** below — a structural replacement for the arm+wait pair
