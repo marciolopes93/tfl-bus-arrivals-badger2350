@@ -31,6 +31,10 @@ STOP_NAME = "Abbey Road"
 MAX_BUSES = 6
 REFRESH_MINS = 2
 WEATHER_MAX_STALE_MINS = 60
+WEATHER_RETRY_BURST = 3    # after a due (hourly) weather fetch fails, retry this
+                           # many more times — one per wake, alongside the bus
+                           # fetch — before the footer drops and attempts fall
+                           # back to hourly. Footer is held through the burst (§8).
 WEATHER_LOCATION = "Westminster"
 AWAKE_MS = 400    # awake window before deep sleep. Short: a button wakes from
                   # deep sleep anyway, so this costs no responsiveness but trims
@@ -38,6 +42,18 @@ AWAKE_MS = 400    # awake window before deep sleep. Short: a button wakes from
                   # lever after REFRESH_MINS (see HANDOFF §8).
 RTC_MIN_VALID_YEAR = 2024   # below this the RTC has reset to its 2000 epoch
                             # (after a full battery death) -> trigger an NTP re-sync.
+
+# Quiet hours (§8 / §9.17): inside this window the app parks — no bus fetching,
+# no 2-minute wakes — behind a static notice. It wakes once per QUIET_SLEEP_MINS
+# for a heartbeat (refresh weather if due; repaint header clock/battery and the
+# footer), sleeping in chunks capped at the time remaining to QUIET_END so the
+# first normal refresh lands on time. Press A for QUIET_OVERRIDE_MINS of normal
+# live updates. Set EITHER bound to None to disable entirely. Skipped while the
+# RTC looks unset (post battery death) so a wrong clock can't trap the device.
+QUIET_START = "22:30"
+QUIET_END   = "05:30"
+QUIET_SLEEP_MINS    = 60
+QUIET_OVERRIDE_MINS = 30
 
 # Low-battery "death screen": at/below LOW_BATT_VOLTS (and not charging) the app
 # latches into a paused state — draws a static warning ONCE and stops all WiFi /
@@ -55,6 +71,14 @@ WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
 
 REQ_TIMEOUT = 8  # seconds
 
+try:
+    # Default socket timeout for ALL fetch paths. do_refresh() repeats this
+    # (harmless), but the quiet-hours heartbeat fetch (§9.17) doesn't go
+    # through do_refresh, so it's set once here too.
+    socket.setdefaulttimeout(REQ_TIMEOUT)
+except Exception:
+    pass
+
 # ---- Runtime globals (reset on every battery wake; see HANDOFF §5.3) --------
 
 buses       = []
@@ -63,9 +87,12 @@ error_msg   = None
 last_ok_at  = None
 weather_at  = None     # "HH:MM" of last weather SUCCESS (drives display)
 weather_try_at = None  # "HH:MM" of last weather ATTEMPT (drives backoff)
+weather_fails = 0      # consecutive failed weather attempts (drives the burst; §8)
 is_stale    = False
 initialised = False
 last_refresh_minute = -1
+last_quiet_draw_minute = -1   # quiet-hours heartbeat gate; matters on USB where
+                              # the loop spins instead of deep-sleeping (§9.17)
 
 # Persisted across deep sleep / reload (JSON-safe values only).
 persist = {
@@ -74,7 +101,9 @@ persist = {
     "last_ok_at": None,
     "weather_at": None,
     "weather_try_at": None,
-    "low_power":  False,   # latched low-battery pause state; survives the reload
+    "weather_fails": 0,        # survives the reload so a burst spans wakes (§8)
+    "low_power":  False,       # latched low-battery pause state
+    "quiet_override_at": None, # "HH:MM" A was pressed during quiet hours (§9.17)
 }
 State.load("tfl", persist)
 
@@ -88,6 +117,7 @@ if persist["weather"] is not None:
 last_ok_at = persist["last_ok_at"]
 weather_at = persist.get("weather_at")
 weather_try_at = persist.get("weather_try_at")
+weather_fails = persist.get("weather_fails") or 0
 
 # ---- Input helpers ---------------------------------------------------------
 
@@ -95,6 +125,18 @@ def _button_a_down():
     """True if button A registered a press this cycle (badge.pressed; §5.5)."""
     try:
         return badge.pressed(BUTTON_A)
+    except Exception:
+        return False
+
+def _woken_by_button():
+    """True if a button was the deep-sleep wake reason. Used by the quiet-hours
+    override (§9.17): a quick tap that wakes the device may be released before
+    the first badge.pressed() poll of the reloaded module, so the wake reason is
+    the reliable signal. UNVERIFIED on-device in this role — if it ever reports
+    True on ALARM wakes the override would never expire (validation item, §12);
+    the fallback is to drop this from the trigger OR in update()."""
+    try:
+        return badge.woken_by_button()
     except Exception:
         return False
 
@@ -159,20 +201,70 @@ def london_now():
     timezone change ever needs a single place to adjust (§9.16)."""
     return time.localtime()
 
+def clock_valid():
+    """False when the RTC has reset to its 2000 epoch (post battery death; §9.13).
+    Gates both the NTP re-sync and quiet hours (§9.17 — never trust an unset
+    clock to decide it's night-time)."""
+    try:
+        return rtc.datetime()[0] >= RTC_MIN_VALID_YEAR
+    except Exception:
+        return False
+
 def sync_clock_if_needed():
-    """No-op unless the RTC looks unset (year < RTC_MIN_VALID_YEAR), i.e. after a
+    """No-op unless the RTC looks unset (clock_valid() False), i.e. after a
     battery death. Then re-seed it from NTP and mirror into the system clock.
     Self-healing: a failed NTP attempt leaves the clock unset and retries next
     refresh. CAVEAT: time_from_ntp() returns UTC and there's no setter to write a
     corrected local value, so a death recovered during BST reads 1h behind until
     fixed — rare, and far better than staying stuck at the 2000 epoch (§9.16)."""
     try:
-        if rtc.datetime()[0] >= RTC_MIN_VALID_YEAR:
+        if clock_valid():
             return
         rtc.time_from_ntp()      # seeds the RTC (UTC; see caveat above)
         rtc.rtc_to_localtime()   # mirror into time.localtime()
     except Exception:
         pass
+
+# ---- Quiet hours (§8 / §9.17) -----------------------------------------------
+
+def _hhmm_to_mins(s):
+    """'HH:MM' -> minutes since midnight, or None if unparseable."""
+    try:
+        hh, mm = s.split(":")
+        return (int(hh) % 24) * 60 + (int(mm) % 60)
+    except Exception:
+        return None
+
+def in_quiet_hours():
+    """True inside the configured quiet window (midnight wraparound supported).
+    Always False if disabled (either bound None), misconfigured, or the clock
+    can't be trusted — an epoch-reset clock reading 00:00 must not park the
+    device in quiet mode and stop it ever fixing its own clock (§9.17)."""
+    if QUIET_START is None or QUIET_END is None:
+        return False
+    if not clock_valid():
+        return False
+    start = _hhmm_to_mins(QUIET_START)
+    end   = _hhmm_to_mins(QUIET_END)
+    if start is None or end is None or start == end:
+        return False
+    t = rtc.datetime()
+    now = t[3] * 60 + t[4]
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end          # window wraps midnight
+
+def mins_until_quiet_end():
+    """Minutes from now to QUIET_END (>= 1 while inside the window)."""
+    end = _hhmm_to_mins(QUIET_END)
+    if end is None:
+        return QUIET_SLEEP_MINS
+    t = rtc.datetime()
+    now = t[3] * 60 + t[4]
+    d = end - now
+    if d <= 0:
+        d += 24 * 60
+    return d
 
 # ---- Network ---------------------------------------------------------------
 # Raw `network` is used on purpose instead of the stock `wifi` helper: the stock
@@ -230,8 +322,8 @@ def fetch_arrivals():
             line        = item.get("lineName", "?")
             destination = item.get("destinationName", "?")
             eta_min     = item.get("timeToStation", 0) // 60
-            if len(destination) > 20:
-                destination = destination[:19] + "~"
+            if len(destination) > 23:
+                destination = destination[:22] + "~"
             result.append({"line": line, "destination": destination, "minutes": eta_min})
         result.sort(key=lambda b: b["minutes"])
         buses = result[:MAX_BUSES]
@@ -250,16 +342,19 @@ def save_state():
         persist["last_ok_at"] = last_ok_at
         persist["weather_at"] = weather_at
         persist["weather_try_at"] = weather_try_at
+        persist["weather_fails"]  = weather_fails
         State.save("tfl", persist)
     except Exception:
         pass
 
 def fetch_weather():
     """Silent failure (keeps old data). Stamps weather_try_at on every attempt
-    for the backoff; saves on all paths. See §8."""
-    global weather, weather_at, weather_try_at
+    for the hourly backoff, and counts consecutive failures in weather_fails to
+    drive the retry burst (§8); saves on all paths."""
+    global weather, weather_at, weather_try_at, weather_fails
     t = rtc.datetime()
     weather_try_at = "{:02d}:{:02d}".format(t[3], t[4])
+    ok = False
     try:
         r = _get(WEATHER_URL)
         if r.status_code == 200:
@@ -273,10 +368,12 @@ def fetch_weather():
             lo        = today["mintempC"]
             weather   = (condition, temp, lo, hi)
             weather_at = weather_try_at   # mark this attempt as the last success
+            ok = True
         else:
             r.close()
     except Exception:
         pass
+    weather_fails = 0 if ok else min(weather_fails + 1, 99)
     save_state()
 
 # ---- Refresh orchestration -------------------------------------------------
@@ -340,8 +437,12 @@ def minutes_since_last_ok():
     return None if m is None else min(m, 99)
 
 def weather_due():
-    """True if a weather fetch is due (backoff; see §8)."""
+    """True if a weather fetch is due: hourly normally, but every wake while a
+    failed hourly attempt is still inside its retry burst (weather_fails in
+    1..WEATHER_RETRY_BURST; §8). Any success resets the counter."""
     if weather_try_at is None:
+        return True
+    if 0 < weather_fails <= WEATHER_RETRY_BURST:
         return True
     m = minutes_since(weather_try_at)
     if m is None:
@@ -349,9 +450,13 @@ def weather_due():
     return m >= WEATHER_MAX_STALE_MINS
 
 def weather_fresh():
-    """True if weather data is younger than the stale threshold."""
+    """True if the footer should show: data younger than the stale threshold, or
+    held over while the retry burst is still in flight (§8) — the footer only
+    drops once the burst is exhausted without a success."""
     if weather is None or weather_at is None:
         return False
+    if 0 < weather_fails <= WEATHER_RETRY_BURST:
+        return True
     m = minutes_since(weather_at)
     if m is None:
         return False
@@ -375,6 +480,40 @@ def _ctext(s, y):
     w, _ = screen.measure_text(s)
     screen.pen = color.black
     screen.text(s, (screen.width - w) // 2, y)
+
+def _draw_header(bat_str, lt):
+    """Black header bar: battery meter LHS, title, clock RHS. Shared by the
+    normal and quiet-hours screens. Leaves the pen black."""
+    screen.pen = color.black
+    screen.rectangle(0, 0, screen.width, 18)
+    screen.pen = color.white
+    screen.font = rom_font.smart
+    if bat_str:
+        screen.text(bat_str, 4, 3)
+    screen.text("TFL  {}".format(STOP_NAME), 50, 3)
+    ts = "{:02d}:{:02d}".format(lt[3], lt[4])
+    w, _ = screen.measure_text(ts)
+    screen.text(ts, screen.width - w - 4, 3)
+    screen.pen = color.black
+
+def _draw_weather_footer(lt):
+    """Weather footer; no-op unless weather_fresh(). Shared by the normal and
+    quiet-hours screens."""
+    if not weather_fresh():
+        return
+    condition, current, lo, hi = weather
+    footer_y = screen.height - 14
+    screen.pen = color.black
+    screen.line(0, footer_y - 4, screen.width, footer_y - 4)
+    DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    date_str = "{}. {:02d}/{:02d}".format(DAYS[lt[6]], lt[2], lt[1])
+    left = "{}: {}".format(date_str, condition)
+    if len(left) > 28:
+        left = left[:27] + "~"
+    screen.text(left, 4, footer_y)
+    right = "{}C ({}, {})".format(current, lo, hi)
+    w, _ = screen.measure_text(right)
+    screen.text(right, screen.width - w - 4, footer_y)
 
 def draw_low_battery(bat_str, volts):
     """Static low-battery warning: a battery glyph with a black 'remaining'
@@ -403,6 +542,19 @@ def draw_low_battery(bat_str, volts):
     _ctext("LOW BATTERY.", 124)
     _ctext("Plug in USB-C to charge.", 146)
 
+def draw_quiet_screen(bat_str, lt):
+    """Quiet-hours notice (§9.17): live header (battery/clock) and weather footer
+    around a static message. Repainted once per QUIET_SLEEP_MINS heartbeat, not
+    per wake/loop."""
+    screen.pen = color.white
+    screen.clear()
+    _draw_header(bat_str, lt)
+    _ctext("Buses are still running -", 30)
+    _ctext("I'm asleep to conserve battery.", 44)
+    _ctext("Auto-updates resume at {}.".format(QUIET_END), 64)
+    _ctext("Press A for an update now.", 84)
+    _draw_weather_footer(lt)
+
 def arm_and_sleep(mins):
     """Arm the periodic wake then deep-sleep until alarm or button. A silently
     swallowed set_alarm() failure here caused the ~48h freeze (slept with no wake
@@ -422,7 +574,7 @@ def arm_and_sleep(mins):
         wait_for_button_or_alarm(timeout=AWAKE_MS)
 
 def update():
-    global initialised, last_refresh_minute
+    global initialised, last_refresh_minute, last_quiet_draw_minute
 
     charging, volts = read_battery()    # BEFORE WiFi comes up (ADC skew); §5.6
     bat_str = battery_str_from(charging, volts)
@@ -447,6 +599,55 @@ def update():
         save_state()
         arm_and_sleep(LOW_POWER_SLEEP_MINS)
         return
+
+    # ---- Quiet-hours gate (§8 / §9.17): park overnight, hourly heartbeat -------
+    # Sits below the low-battery gate (battery safety wins) and above the normal
+    # refresh path. in_quiet_hours() is False when disabled or the clock is
+    # untrusted, so the post-death NTP self-heal still runs via the normal path.
+    if in_quiet_hours():
+        # Button A — pressed this cycle, or the reason we woke from deep sleep
+        # (a quick tap can be released before the reloaded module's first poll)
+        # — (re)starts a live-updates override. woken_by_button() is unverified
+        # in this role: if it reports True on ALARM wakes the override never
+        # expires — see §12 validation; fallback is to drop it from this OR.
+        if _button_a_down() or _woken_by_button():
+            t = rtc.datetime()
+            persist["quiet_override_at"] = "{:02d}:{:02d}".format(t[3], t[4])
+            save_state()
+        ov = minutes_since(persist.get("quiet_override_at"))
+        if ov is not None and ov < QUIET_OVERRIDE_MINS:
+            pass   # override active -> fall through to normal live operation
+        else:
+            if persist.get("quiet_override_at") is not None:
+                persist["quiet_override_at"] = None   # expired: clear it so the
+                save_state()              # HH:MM stamp can't wrap around 24h and
+                                          # spuriously re-trigger tomorrow night
+                last_quiet_draw_minute = -1   # repaint over the override's bus UI
+            t = rtc.datetime()
+            now_min = t[3] * 60 + t[4]
+            elapsed_q = now_min - last_quiet_draw_minute
+            if elapsed_q < 0:                          # crossed midnight
+                elapsed_q += 24 * 60
+            # Hourly heartbeat: weather-only fetch when due, then repaint the
+            # header clock/battery + footer. On battery every wake is a fresh
+            # reload (last_quiet_draw_minute = -1) so each chunk repaints; on
+            # USB (loop spins, no deep sleep) this gate stops constant redraws.
+            if last_quiet_draw_minute < 0 or elapsed_q >= QUIET_SLEEP_MINS:
+                if weather_due():
+                    if not wifi_connected():
+                        connect_wifi()
+                    if wifi_connected():
+                        fetch_weather()
+                draw_quiet_screen(bat_str, london_now())
+                badge.update()
+                last_quiet_draw_minute = now_min
+            # Chunked sleep, capped so the first normal refresh lands at QUIET_END
+            arm_and_sleep(min(QUIET_SLEEP_MINS, mins_until_quiet_end()))
+            return
+    elif persist.get("quiet_override_at") is not None:
+        persist["quiet_override_at"] = None   # left the quiet window; tidy the
+        save_state()                          # latch (same 24h-wrap reasoning)
+        last_quiet_draw_minute = -1
 
     t = rtc.datetime()
     current_minute = t[3] * 60 + t[4]
@@ -477,19 +678,7 @@ def update():
 
     lt = london_now()                   # UK wall-clock; header clock + footer date
 
-    # Header bar
-    screen.pen = color.black
-    screen.rectangle(0, 0, screen.width, 18)
-    screen.pen = color.white
-    screen.font = rom_font.smart
-    if bat_str:
-        screen.text(bat_str, 4, 3)
-    screen.text("TFL  {}".format(STOP_NAME), 50, 3)
-    ts = "{:02d}:{:02d}".format(lt[3], lt[4])
-    w, _ = screen.measure_text(ts)
-    screen.text(ts, screen.width - w - 4, 3)
-
-    screen.pen = color.black
+    _draw_header(bat_str, lt)
 
     if error_msg:
         screen.font = rom_font.smart
@@ -521,21 +710,8 @@ def update():
             screen.text(min_str, screen.width - w - 4, y)
             y += row_h
 
-        # Weather footer (hidden once stale)
-        if weather_fresh():
-            condition, current, lo, hi = weather
-            footer_y = screen.height - 14
-            screen.pen = color.black
-            screen.line(0, footer_y - 4, screen.width, footer_y - 4)
-            DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-            date_str = "{}. {:02d}/{:02d}".format(DAYS[lt[6]], lt[2], lt[1])
-            left = "{}: {}".format(date_str, condition)
-            if len(left) > 28:
-                left = left[:27] + "~"
-            screen.text(left, 4, footer_y)
-            right = "{}C ({}, {})".format(current, lo, hi)
-            w, _ = screen.measure_text(right)
-            screen.text(right, screen.width - w - 4, footer_y)
+        # Weather footer (hidden once stale; held through a retry burst — §8)
+        _draw_weather_footer(lt)
 
     # Push e-ink only when we refreshed (avoids constant redraw on USB; §5.3)
     if should_refresh:
