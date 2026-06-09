@@ -1,4 +1,4 @@
-# Badger 2350 — TfL Bus Arrivals Display
+# <img src="icon.png" width="24" alt=""> Badger 2350 — TfL Bus Arrivals Display
 
 A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350) e-ink badge that turns it into a tiny live departures board for a London bus stop, with a one-line weather summary underneath.
 
@@ -7,15 +7,15 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 
 ```
 +------------------------------------------------------------+
-| 84%   TFL  Abbey Road                        08:47  |
+| 84%   TFL  Abbey Road                         08:47 |
 |------------------------------------------------------------|
-| Line   Destination                              Min        |
+| Line   Destination                               Min       |
 | ---------------------------------------------------------- |
-| 18     Euston                                     2        |
-| 27     Camden Town                                5        |
+| 18     Euston                                      2       |
+| 27     Camden Town                                 5       |
 | ...                                                        |
 | ---------------------------------------------------------- |
-| Sat. 30/05: Partly cloudy            12C (9, 18)           |
+| Sat. 30/05: Partly cloudy             12C (9, 18)          |
 +------------------------------------------------------------+
 ```
 
@@ -23,9 +23,8 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 
 - Live arrival predictions for any TfL bus stop, refreshed every 2 minutes (configurable)
 - Current conditions + today's high/low for any location, via wttr.in, refreshed hourly
-- Battery-aware: deep-sleeps between refreshes, shows a voltage-derived charge percentage, and latches into a static low-battery "death screen" instead of draining the last of the cell into doomed refreshes
-- Degrades gracefully offline: keeps showing the last known arrivals with a "Stale — N min ago" banner instead of a blank error
-- Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time for 30 minutes of live updates
+- Battery-aware: deep-sleeps between refreshes, shows a voltage-derived charge percentage, and latches into a static low-battery "death screen" instead of dying on stale data which might be missed on a quick glance
+- Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time to resume live updates during quiet hours
 - Resilient weather: a failed hourly fetch is retried 3 more times over the next few minutes before the footer is dropped
 - Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes)
 - **Button A** forces an immediate refresh of both buses and weather
@@ -36,7 +35,6 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 |------|-------------|
 | Device | Pimoroni Badger 2350 |
 | Firmware | **Badgeware v2.0.2** (the v2.x API — older "v4" BadgerOS examples are incompatible) |
-| Cable | USB-C **data** cable (charge-only cables won't expose the disk) |
 | Network | 2.4 GHz WiFi |
 
 No TfL API key is required at the default refresh rate (the unauthenticated limit is 50 req/min; this app makes ~30 req/hour).
@@ -45,7 +43,7 @@ No TfL API key is required at the default refresh rate (the unauthenticated limi
 
 1. **Enter disk mode:** with the badge powered, double-tap **RESET**. A disk named `BADGER` appears — its root *is* the device's `/system` folder.
 2. **Copy the app:** create `apps/tfl/` on the disk and copy `__init__.py` and `icon.png` into it. Both filenames are mandatory — the launcher only lists folders containing a file literally named `icon.png`, and the entry point must be `__init__.py`.
-3. **WiFi credentials:** copy `secrets.py.example` to the disk root as `secrets.py` (i.e. `/system/secrets.py` on the device) and fill in your SSID and password. *Never commit your real `secrets.py` anywhere.*
+3. **WiFi credentials:** copy `secrets.py.example` to the disk root as `secrets.py` (i.e. `/system/secrets.py` on the device) and fill in your SSID and password.
 4. **Set your stop:** edit `STOP_ID` and `STOP_NAME` at the top of `__init__.py` (see [Finding your stop ID](#finding-your-stop-id)), and `WEATHER_LOCATION` if you want weather for somewhere other than Westminster.
 5. Safely eject the disk, press **RESET**, and launch *tfl* from the menu.
 
@@ -72,12 +70,12 @@ The full list — including timeouts, the low-battery hysteresis pair, the LiPo 
 
 ## How it works (short version)
 
-On battery the app lives in a *wake → fetch → draw → arm alarm → deep sleep* cycle. Deep sleep is a full reset on this firmware, so cached arrivals, weather, and timestamps are persisted to flash via the `State` API and rehydrated on every wake. The RTC alarm that drives the periodic wake is armed with a verified retry — the device only sleeps once an alarm is confirmed set, because sleeping without one means it never wakes again (we learned this the hard way; see the troubleshooting doc). On USB power the badge never deep-sleeps, so the same loop runs continuously with time-based gating to avoid hammering the e-ink.
+On battery the app lives in a *wake → fetch → draw → arm alarm → deep sleep* cycle. Deep sleep is a full reset on this firmware, so cached arrivals, weather, and timestamps are persisted to flash via the `State` API and rehydrated on every wake. The RTC alarm that drives the periodic wake is armed with a verified retry — the device only sleeps once an alarm is confirmed set, because sleeping without one means it never wakes again (I learned this the hard way). On USB power the badge never deep-sleeps, so the same loop runs continuously with time-based gating to avoid hammering the e-ink.
 
 The longer version — architecture, resilience behaviour, and every firmware quirk encountered — lives in the docs:
 
 - **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — every setting, with guidance
-- **[docs/FIRMWARE-NOTES.md](docs/FIRMWARE-NOTES.md)** — Badgeware v2.x field notes (injected globals, RTC behaviour, battery readings, e-ink greys). Useful even if you never run this app
+- **[docs/FIRMWARE-NOTES.md](docs/FIRMWARE-NOTES.md)** — Badgeware v2.x field notes (injected globals, RTC behaviour, battery readings, e-ink greys)
 - **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — symptom → cause → fix
 - **[HANDOFF.md](HANDOFF.md)** — the complete development log and source-of-truth design document. Code comments cross-reference it by `§` section
 
