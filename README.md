@@ -7,7 +7,7 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 
 ```
 +------------------------------------------------------------+
-| 84%   TFL  Abbey Road                         08:47 |
+| 84%   TFL  Abbey Road                         08:47        |
 |------------------------------------------------------------|
 | Line   Destination                               Min       |
 | ---------------------------------------------------------- |
