@@ -1,49 +1,102 @@
-# Badger 2350 TFL Bus + Weather App
+# Badger 2350 — TfL Bus Arrivals Display
 
-A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350)
-e-ink badge that shows **live London bus arrival times** for a single
-stop, plus a one-line **weather summary**. It auto-refreshes on a timer, degrades
-gracefully when offline (keeps showing last-known data with a stale warning), and
-displays the battery level. 🚌
+A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350) e-ink badge that turns it into a tiny live departures board for a London bus stop, with a one-line weather summary underneath.
 
-> **Requires Badgeware firmware v2.0.0 or later.** The app uses the v2.x API
-> (`update`/button-press/`mode` calls changed in v2.0). It will **not** run on
-> the older BadgerOS "v4" firmware.
+<!-- TODO: add photo of the badge running the app -->
+<!-- ![Badger 2350 running the TfL app](docs/images/badge.jpg) -->
 
-![App icon](icon.png)
+```
++------------------------------------------------------------+
+| 84%   TFL  Abbey Road                        08:47  |
+|------------------------------------------------------------|
+| Line   Destination                              Min        |
+| ---------------------------------------------------------- |
+| 18     Euston                                     2        |
+| 27     Camden Town                                5        |
+| ...                                                        |
+| ---------------------------------------------------------- |
+| Sat. 30/05: Partly cloudy            12C (9, 18)           |
++------------------------------------------------------------+
+```
 
-## What it does
+## Features
 
-- Live bus arrivals for a configured TFL stop (default: **Abbey Road**, `490003028E`)
-- One-line weather footer for a configured location (default: **Westminster**)
-- Auto-refresh every 2 minutes (press **A** for an instant refresh)
-- Survives deep-sleep via `State` persistence; shows stale data + warning when offline
-- Battery percentage in the header
+- Live arrival predictions for any TfL bus stop, refreshed every 2 minutes (configurable)
+- Current conditions + today's high/low for any location, via wttr.in, refreshed hourly
+- Battery-aware: deep-sleeps between refreshes, shows a voltage-derived charge percentage, and latches into a static low-battery "death screen" instead of draining the last of the cell into doomed refreshes
+- Degrades gracefully offline: keeps showing the last known arrivals with a "Stale — N min ago" banner instead of a blank error
+- Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time for 30 minutes of live updates
+- Resilient weather: a failed hourly fetch is retried 3 more times over the next few minutes before the footer is dropped
+- Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes)
+- **Button A** forces an immediate refresh of both buses and weather
 
-## Files
+## Hardware & firmware requirements
 
-| File | Purpose |
-|------|---------|
-| `__init__.py` | The app. Deploys to `/system/apps/tfl/__init__.py` on the badge. |
-| `icon.png` | 24×24 launcher icon. Deploys to `/system/apps/tfl/icon.png`. |
-| `HANDOFF.md` | Full source-of-truth doc: hardware, Badgeware v2.x API notes, APIs, UI layout, bugs fixed. **Read this before changing code.** |
+| Item | Requirement |
+|------|-------------|
+| Device | Pimoroni Badger 2350 |
+| Firmware | **Badgeware v2.0.2** (the v2.x API — older "v4" BadgerOS examples are incompatible) |
+| Cable | USB-C **data** cable (charge-only cables won't expose the disk) |
+| Network | 2.4 GHz WiFi |
 
-## Quick start
+No TfL API key is required at the default refresh rate (the unauthenticated limit is 50 req/min; this app makes ~30 req/hour).
 
-1. Put the badge in USB disk mode.
-2. Copy `__init__.py` and `icon.png` into `apps/tfl/` on the disk
-   (this is `/system/apps/tfl/` on the device).
-3. Ensure `/system/secrets.py` has `WIFI_SSID` and `WIFI_PASSWORD`.
-4. Safely eject, press **RESET**, launch **TFL** from the menu.
+## Installation
 
-See [`HANDOFF.md`](HANDOFF.md) for the full setup, API reference, and config knobs.
+1. **Enter disk mode:** with the badge powered, double-tap **RESET**. A disk named `BADGER` appears — its root *is* the device's `/system` folder.
+2. **Copy the app:** create `apps/tfl/` on the disk and copy `__init__.py` and `icon.png` into it. Both filenames are mandatory — the launcher only lists folders containing a file literally named `icon.png`, and the entry point must be `__init__.py`.
+3. **WiFi credentials:** copy `secrets.py.example` to the disk root as `secrets.py` (i.e. `/system/secrets.py` on the device) and fill in your SSID and password. *Never commit your real `secrets.py` anywhere.*
+4. **Set your stop:** edit `STOP_ID` and `STOP_NAME` at the top of `__init__.py` (see [Finding your stop ID](#finding-your-stop-id)), and `WEATHER_LOCATION` if you want weather for somewhere other than Westminster.
+5. Safely eject the disk, press **RESET**, and launch *tfl* from the menu.
+
+### Finding your stop ID
+
+The `STOP_ID` is TfL's Naptan ID (e.g. `490003028E`). The easiest way to find yours: search your stop on [tfl.gov.uk](https://tfl.gov.uk) bus arrivals and look at the URL, or query
+`https://api.tfl.gov.uk/StopPoint/Search/{your stop name}` in a browser and pick the `id` of the right stop (the trailing letter distinguishes direction/side of road).
 
 ## Configuration
 
-Knobs live at the top of `__init__.py`: `STOP_ID`, `STOP_NAME`, `MAX_BUSES`,
-`REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`, `WEATHER_LOCATION`, `REQ_TIMEOUT`.
+The main knobs, all at the top of `__init__.py`:
 
-## Data sources
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `STOP_ID` / `STOP_NAME` | — | TfL Naptan ID to monitor, and the header label |
+| `MAX_BUSES` | `6` | Rows shown (6 fits the layout) |
+| `REFRESH_MINS` | `2` | Wake/fetch interval — the main battery lever |
+| `WEATHER_LOCATION` | `Westminster` | wttr.in place name |
+| `WEATHER_MAX_STALE_MINS` | `60` | Weather retry interval *and* the age past which the footer is hidden |
+| `QUIET_START` / `QUIET_END` | `"22:30"` / `"05:30"` | Overnight pause window — no bus fetching, hourly heartbeat only. Set either to `None` to disable |
+| `LOW_BATT_VOLTS` | `3.45` | Voltage at which the low-battery screen latches |
 
-- **Buses:** [TFL Unified API](https://api.tfl.gov.uk/) — no key required at this volume.
-- **Weather:** [wttr.in](http://wttr.in/) JSON endpoint (HTTP, not HTTPS — see HANDOFF.md).
+The full list — including timeouts, the low-battery hysteresis pair, the LiPo calibration curve, and which layout values are safely tweakable — is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## How it works (short version)
+
+On battery the app lives in a *wake → fetch → draw → arm alarm → deep sleep* cycle. Deep sleep is a full reset on this firmware, so cached arrivals, weather, and timestamps are persisted to flash via the `State` API and rehydrated on every wake. The RTC alarm that drives the periodic wake is armed with a verified retry — the device only sleeps once an alarm is confirmed set, because sleeping without one means it never wakes again (we learned this the hard way; see the troubleshooting doc). On USB power the badge never deep-sleeps, so the same loop runs continuously with time-based gating to avoid hammering the e-ink.
+
+The longer version — architecture, resilience behaviour, and every firmware quirk encountered — lives in the docs:
+
+- **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)** — every setting, with guidance
+- **[docs/FIRMWARE-NOTES.md](docs/FIRMWARE-NOTES.md)** — Badgeware v2.x field notes (injected globals, RTC behaviour, battery readings, e-ink greys). Useful even if you never run this app
+- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — symptom → cause → fix
+- **[HANDOFF.md](HANDOFF.md)** — the complete development log and source-of-truth design document. Code comments cross-reference it by `§` section
+
+## Screens you may see
+
+- **Normal:** the table above.
+- **Stale:** the column headers are replaced by `Stale - N min ago - press A` when a refresh fails but cached data exists. Clears on the next successful fetch.
+- **Error:** `WiFi failed / Could not fetch - press A to retry` — only when there is *no* cached data (e.g. first launch while offline).
+- **Quiet hours:** overnight (default 22:30–05:30) the table is replaced by a notice that buses are still running but the badge is asleep to conserve battery. The header clock/battery and the weather footer refresh hourly; **press A** for 30 minutes of live updates, after which it parks again.
+- **Low battery:** a full-screen battery glyph with the voltage reading. The app pauses all activity, holds this image (e-ink needs no power to do so), and polls every 15 minutes for a charger. Plug in USB-C to resume.
+
+## Dependencies
+
+Everything ships with Badgeware v2.0.2 — there is nothing to `pip install`. The app uses the firmware's injected globals (`screen`, `badge`, `rtc`, `State`, …), MicroPython stdlib (`time`, `socket`, `json`, `network`, `requests`), the [TfL Unified API](https://api.tfl.gov.uk) (no key) and [wttr.in](https://wttr.in) (plain HTTP — HTTPS to wttr.in fails on this board; the TfL call is HTTPS and fine).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+Pimoroni for the Badger 2350 and Badgeware; TfL for the open arrivals API; [wttr.in](https://github.com/chubin/wttr.in) for keyless weather.
