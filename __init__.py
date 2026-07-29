@@ -43,6 +43,34 @@ AWAKE_MS = 400    # awake window before deep sleep. Short: a button wakes from
 RTC_MIN_VALID_YEAR = 2024   # below this the RTC has reset to its 2000 epoch
                             # (after a full battery death) -> trigger an NTP re-sync.
 
+# Stop disruption / closure failover (§9.18). TfL publishes stop-level closures on
+# a SEPARATE endpoint from arrivals — /StopPoint/{id}/Arrivals keeps serving live
+# times for a stop nobody can board at, which is exactly the trap this closes. The
+# endpoint returns a JSON list ([] when nothing is wrong), needs no API key, and
+# changes on a scale of days, so it rides the hourly weather cadence rather than
+# the 2-minute bus one (~24 extra GETs/day against ~720 — negligible; §8).
+#
+# When an ACTIVE closure is reported at STOP_ID the app transparently switches the
+# arrivals fetch to ALT_STOP_ID and retitles the header, so the panel shows times
+# you can actually act on. Set ALT_STOP_ID = None to keep the notice but stay on
+# STOP_ID (notice-only mode).
+#
+# Pick ALT_STOP_ID as a nearby stop on the same route and direction that you can
+# realistically walk to. Prefer the NEXT stop downstream: it's usually close by,
+# and because its arrival times are later than your home stop's, the walk is
+# already priced into the number on screen (walking to the PREVIOUS stop inverts
+# that — you'd be chasing a time that's already elapsing). The values below are
+# illustrative placeholders; set your own from the TfL Naptan IDs of your stops.
+ALT_STOP_ID   = "490004555P"
+ALT_STOP_NAME = "Buckingham Palace Rd"  # keep short: shares the header bar with the
+                                        # clock and battery meter (~20 chars max)
+DISRUPTION_MAX_STALE_MINS = 60
+DISRUPTION_RETRY_BURST    = 3   # same burst shape as weather, but the FAIL-SAFE
+                                # RUNS THE OTHER WAY: a failed fetch HOLDS the last
+                                # known closure indefinitely. Only a successful
+                                # empty response clears it. Never silently drop a
+                                # warning that stops you boarding (§9.18).
+
 # Quiet hours (§8 / §9.17): inside this window the app parks — no bus fetching,
 # no 2-minute wakes — behind a static notice. It wakes once per QUIET_SLEEP_MINS
 # for a heartbeat (refresh weather if due; repaint header clock/battery and the
@@ -66,8 +94,13 @@ LOW_BATT_RESUME_VOLTS = 3.60   # hysteresis: auto-resume only above this (or whe
                                # charging) so it can't flap at the threshold
 LOW_POWER_SLEEP_MINS  = 15     # while paused, wake this rarely to poll for charge
 
-TFL_URL     = "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(STOP_ID)
 WEATHER_URL = "http://wttr.in/{}?format=j1".format(WEATHER_LOCATION)
+DISRUPTION_URL = "https://api.tfl.gov.uk/StopPoint/{}/Disruption".format(STOP_ID)
+
+def arrivals_url(stop_id):
+    """Arrivals endpoint for a stop. Built per-call rather than as a constant
+    because the stop in use can change under failover (§9.18)."""
+    return "https://api.tfl.gov.uk/StopPoint/{}/Arrivals".format(stop_id)
 
 REQ_TIMEOUT = 8  # seconds
 
@@ -88,6 +121,12 @@ last_ok_at  = None
 weather_at  = None     # "HH:MM" of last weather SUCCESS (drives display)
 weather_try_at = None  # "HH:MM" of last weather ATTEMPT (drives backoff)
 weather_fails = 0      # consecutive failed weather attempts (drives the burst; §8)
+disruption      = None # normalised one-line TfL notice, or None for "all clear"
+disruption_type = None # TfL `type` field — "Closure" is the one that triggers
+                       # failover; anything else is shown but not acted on
+disruption_at     = None  # "HH:MM" of last disruption SUCCESS
+disruption_try_at = None  # "HH:MM" of last disruption ATTEMPT (drives backoff)
+disruption_fails  = 0
 is_stale    = False
 initialised = False
 last_refresh_minute = -1
@@ -102,6 +141,11 @@ persist = {
     "weather_at": None,
     "weather_try_at": None,
     "weather_fails": 0,        # survives the reload so a burst spans wakes (§8)
+    "disruption":      None,   # the closure must survive the deep-sleep reload,
+    "disruption_type": None,   # or every wake would show an unwarned stop for
+    "disruption_at":     None, # up to an hour until the next hourly fetch (§9.18)
+    "disruption_try_at": None,
+    "disruption_fails":  0,
     "low_power":  False,       # latched low-battery pause state
     "quiet_override_at": None, # "HH:MM" A was pressed during quiet hours (§9.17)
 }
@@ -118,6 +162,11 @@ last_ok_at = persist["last_ok_at"]
 weather_at = persist.get("weather_at")
 weather_try_at = persist.get("weather_try_at")
 weather_fails = persist.get("weather_fails") or 0
+disruption        = persist.get("disruption")
+disruption_type   = persist.get("disruption_type")
+disruption_at     = persist.get("disruption_at")
+disruption_try_at = persist.get("disruption_try_at")
+disruption_fails  = persist.get("disruption_fails") or 0
 
 # ---- Input helpers ---------------------------------------------------------
 
@@ -203,8 +252,8 @@ def london_now():
 
 def clock_valid():
     """False when the RTC has reset to its 2000 epoch (post battery death; §9.13).
-    Gates both the NTP re-sync and quiet hours (§9.17 — never trust an unset
-    clock to decide it's night-time)."""
+    Gates the NTP re-sync, quiet hours (§9.17 — never trust an unset clock to
+    decide it's night-time) and the disruption date window (§9.18)."""
     try:
         return rtc.datetime()[0] >= RTC_MIN_VALID_YEAR
     except Exception:
@@ -307,11 +356,147 @@ def _get(url):
     except TypeError:
         return requests.get(url)
 
+# ---- Stop disruption (§9.18) ------------------------------------------------
+
+def _collapse_ws(s):
+    """Collapse TfL's embedded newlines and cosmetic indentation into one line.
+    The live payload is literally:
+        'Bus Stop Closed\\n    Please use the next stop\\n      or the previous
+         stop \\n       to catch your bus'
+    — formatted for a web page, not a 264px panel. Written as a char loop rather
+    than ' '.join(s.split()) purely to stay obvious about what it does; both are
+    fine on MicroPython."""
+    out = []
+    prev_space = True          # True so leading whitespace is dropped
+    for ch in s:
+        if ch in " \t\r\n":
+            if not prev_space:
+                out.append(" ")
+            prev_space = True
+        else:
+            out.append(ch)
+            prev_space = False
+    return "".join(out).strip()
+
+def _window_active(item):
+    """Is this disruption live TODAY? fromDate/toDate are ISO-8601, and ISO dates
+    sort correctly as plain strings, so a lexical compare of the 'YYYY-MM-DD'
+    prefix does the whole job — no date parsing on MicroPython.
+
+    Fails OPEN in every ambiguous case (unset clock, missing or malformed bounds):
+    a closure we cannot date-check is better shown than hidden (§9.18)."""
+    if not clock_valid():
+        return True
+    try:
+        t = rtc.datetime()
+        today = "{:04d}-{:02d}-{:02d}".format(t[0], t[1], t[2])
+        frm = item.get("fromDate") or ""
+        if len(frm) >= 10 and today < frm[:10]:
+            return False
+        to = item.get("toDate") or ""
+        if len(to) >= 10 and today > to[:10]:
+            return False
+    except Exception:
+        pass
+    return True
+
+def fetch_disruption():
+    """Refresh the stop-closure state. Success ALWAYS writes the result, including
+    the empty case — a successful [] is how a closure ends, and is the only thing
+    that clears the warning. Failure leaves the previous state untouched and just
+    bumps the counter (inverted fail-safe vs weather; see DISRUPTION_RETRY_BURST)."""
+    global disruption, disruption_type, disruption_at, disruption_try_at, disruption_fails
+    t = rtc.datetime()
+    disruption_try_at = "{:02d}:{:02d}".format(t[3], t[4])
+    ok = False
+    try:
+        r = _get(DISRUPTION_URL)
+        if r.status_code == 200:
+            data = r.json()
+            r.close()
+            note = None
+            kind = None
+            for item in data:
+                if not _window_active(item):
+                    continue
+                kind = item.get("type") or "Disruption"
+                note = _collapse_ws(item.get("description") or kind)
+                if kind == "Closure":
+                    break     # a closure outranks any lesser Information notice,
+                              # so stop looking once one is found
+            disruption      = note
+            disruption_type = kind
+            disruption_at   = disruption_try_at
+            ok = True
+        else:
+            r.close()
+    except Exception:
+        pass
+    disruption_fails = 0 if ok else min(disruption_fails + 1, 99)
+    save_state()
+
+def disruption_due():
+    """Hourly, but every wake while inside a retry burst — same shape as
+    weather_due() (§8)."""
+    if disruption_try_at is None:
+        return True
+    if 0 < disruption_fails <= DISRUPTION_RETRY_BURST:
+        return True
+    m = minutes_since(disruption_try_at)
+    if m is None:
+        return True
+    return m >= DISRUPTION_MAX_STALE_MINS
+
+def stop_closed():
+    """True when the live disruption is a stop CLOSURE — the only type that
+    justifies moving the arrivals fetch to another stop."""
+    return disruption is not None and disruption_type == "Closure"
+
+def active_stop():
+    """(stop_id, stop_name) to fetch and title with THIS cycle. The single source
+    of truth for failover: arrivals, the header and the alert all read it, so they
+    can't disagree about which stop is on screen (§9.18)."""
+    if stop_closed() and ALT_STOP_ID:
+        return ALT_STOP_ID, ALT_STOP_NAME
+    return STOP_ID, STOP_NAME
+
+ALERT_SUFFIX = " Closed"
+
+def alert_text():
+    """One line for the alert bar, or None when there's nothing to say.
+
+    Names the HOME stop, not the one being displayed: the header already says
+    which stop the arrivals below belong to, so the bar's job is to explain WHY
+    it changed. Read together — header "TFL  Buckingham Palace Rd", bar "Abbey
+    Road Closed" — that's the whole story in two lines.
+
+    We deliberately DON'T show TfL's own description on a closure: it runs to ~76
+    characters ("...use the next stop or the previous stop to catch your bus"),
+    which at 6px/char is 456px against a 264px panel, and the advice is already spent
+    — the panel is showing that stop. Non-closure notices are rarer and
+    unmodelled, so those pass TfL's text straight through."""
+    if disruption is None:
+        return None
+    if stop_closed():
+        # Trim the NAME against the remaining width, never the suffix: letting
+        # _fit() loose on the whole string could yield e.g. "Long Stop Name Clos~"
+        # and lose the only word that matters.
+        try:
+            w, _ = screen.measure_text(ALERT_SUFFIX)
+        except Exception:
+            w = 0
+        return _fit(STOP_NAME, screen.width - 8 - w) + ALERT_SUFFIX
+    return disruption
+
+# ---- Arrivals / weather -----------------------------------------------------
+
 def fetch_arrivals():
-    """True on success; on failure leaves old `buses` intact."""
+    """True on success; on failure leaves old `buses` intact. Queries whichever
+    stop active_stop() nominates, so a closure silently redirects it (§9.18)."""
     global buses, last_ok_at
     try:
-        r = _get(TFL_URL)
+        stop_id, _ = active_stop()
+        r = _get(arrivals_url(stop_id))
         if r.status_code != 200:
             r.close()
             return False
@@ -343,6 +528,11 @@ def save_state():
         persist["weather_at"] = weather_at
         persist["weather_try_at"] = weather_try_at
         persist["weather_fails"]  = weather_fails
+        persist["disruption"]        = disruption
+        persist["disruption_type"]   = disruption_type
+        persist["disruption_at"]     = disruption_at
+        persist["disruption_try_at"] = disruption_try_at
+        persist["disruption_fails"]  = disruption_fails
         State.save("tfl", persist)
     except Exception:
         pass
@@ -378,9 +568,10 @@ def fetch_weather():
 
 # ---- Refresh orchestration -------------------------------------------------
 
-def do_refresh(force_weather=False):
-    """Reconnect, fetch buses, fetch weather when due/forced; degrade to
-    stale/error when offline (see §8)."""
+def do_refresh(forced=False):
+    """Reconnect, refresh disruption when due, fetch buses, fetch weather when
+    due; degrade to stale/error when offline (see §8). `forced` is set by a manual
+    A press and skips the hourly gate on both the disruption and weather fetches."""
     global error_msg, is_stale
 
     try:
@@ -401,8 +592,14 @@ def do_refresh(force_weather=False):
 
     sync_clock_if_needed()   # re-sync the RTC if a battery death reset it (§9.13)
 
+    # ORDER MATTERS: disruption first. It decides which stop fetch_arrivals()
+    # queries, so running it second would leave the panel one cycle behind the
+    # closure — showing the closed stop's times under a "closed" banner (§9.18).
+    if forced or disruption_due():
+        fetch_disruption()
+
     bus_ok = fetch_arrivals()
-    if force_weather or weather_due():
+    if forced or weather_due():
         fetch_weather()
 
     if bus_ok:
@@ -481,19 +678,91 @@ def _ctext(s, y):
     screen.pen = color.black
     screen.text(s, (screen.width - w) // 2, y)
 
+def _fit(s, max_w):
+    """Trim `s` to fit max_w pixels, marking the cut with '~' — same convention as
+    the destination truncation in fetch_arrivals(). Measures rather than counting
+    characters because rom_font.smart is proportional."""
+    try:
+        w, _ = screen.measure_text(s)
+        if w <= max_w:
+            return s
+        while len(s) > 1:
+            s = s[:-1]
+            w, _ = screen.measure_text(s + "~")
+            if w <= max_w:
+                return s + "~"
+    except Exception:
+        pass
+    return s
+
 def _draw_header(bat_str, lt):
     """Black header bar: battery meter LHS, title, clock RHS. Shared by the
-    normal and quiet-hours screens. Leaves the pen black."""
+    normal and quiet-hours screens. Titles with active_stop() so the name always
+    matches the arrivals below it under failover (§9.18). Leaves the pen black."""
     screen.pen = color.black
     screen.rectangle(0, 0, screen.width, 18)
     screen.pen = color.white
     screen.font = rom_font.smart
+    # y=2, not the arithmetically-centred 3: rom_font.smart renders with a pixel
+    # or two of padding above the glyph, so 3 sits visibly low in an 18px bar.
+    # All three below must move together. _draw_alert() uses top+2 to match (§7).
     if bat_str:
-        screen.text(bat_str, 4, 3)
-    screen.text("TFL  {}".format(STOP_NAME), 50, 3)
+        screen.text(bat_str, 4, 2)
+    screen.text("TFL  {}".format(active_stop()[1]), 50, 2)
     ts = "{:02d}:{:02d}".format(lt[3], lt[4])
     w, _ = screen.measure_text(ts)
-    screen.text(ts, screen.width - w - 4, 3)
+    screen.text(ts, screen.width - w - 4, 2)
+    screen.pen = color.black
+
+ALERT_H = 18    # Alert bar height. Set from the panel, not from arithmetic (§5
+                # house rule): at 15 the text sat low in the bar with a couple of
+                # dead rows above it; at 18 it centres with one row of black top
+                # and bottom. Happens to match the header bar, which is why the
+                # two read as a pair. All six bus rows still fit alongside it.
+
+FOOTER_RULE_Y = 18   # distance from the panel bottom to the weather rule, i.e.
+                     # the `footer_y - 4` in _draw_weather_footer(). Named because
+                     # it's now shared with _alert_top() and equal to ALERT_H by
+                     # coincidence — don't let a future tweak conflate them.
+
+def _alert_top():
+    """y of the alert bar — the second-to-last line. Sits directly on top of the
+    weather rule when the footer is showing, and drops to the bottom line of the
+    panel when it isn't, so it's always the last thing above the weather and never
+    leaves a gap (§9.18)."""
+    if weather_fresh():
+        return screen.height - FOOTER_RULE_Y - ALERT_H
+    return screen.height - ALERT_H
+
+def _rows_bottom(alert):
+    """Lowest y a bus row may start at, or None for no limit.
+
+    A safety net, not a design constraint: on-device all six rows fit above the
+    bar with room to spare, so this never fires in normal use. It's here so that a
+    future MAX_BUSES bump, a taller ALERT_H or a wider font degrades by dropping
+    the last row rather than by drawing bus times underneath a black bar. Only
+    clamps while the bar is up; the normal screen is the original layout
+    untouched (§9.18)."""
+    if not alert:
+        return None
+    return _alert_top() - 2
+
+def _draw_alert(msg):
+    """Inverted (white-on-black) notice on the second-to-last line, text centred.
+
+    Below the bus rows rather than in the y=22 status slot, so the
+    Line/Destination/Min headings and the 'Stale' message keep their row and the
+    table still reads as a table. Inverted rather than plain text so it reads as
+    an exception, not as data. Drawn LAST so it lands over a clean background
+    whatever ran before it. Leaves the pen black."""
+    top = _alert_top()
+    screen.pen = color.black
+    screen.rectangle(0, top, screen.width, ALERT_H)
+    screen.pen = color.white
+    screen.font = rom_font.smart
+    msg = _fit(msg, screen.width - 8)
+    w, _ = screen.measure_text(msg)
+    screen.text(msg, (screen.width - w) // 2, top + 2)
     screen.pen = color.black
 
 def _draw_weather_footer(lt):
@@ -545,7 +814,9 @@ def draw_low_battery(bat_str, volts):
 def draw_quiet_screen(bat_str, lt):
     """Quiet-hours notice (§9.17): live header (battery/clock) and weather footer
     around a static message. Repainted once per QUIET_SLEEP_MINS heartbeat, not
-    per wake/loop."""
+    per wake/loop. Deliberately does NOT surface the disruption alert — the
+    heartbeat doesn't fetch it, so anything drawn here could be up to a night old,
+    and normal refreshes resume at QUIET_END anyway (§9.18)."""
     screen.pen = color.white
     screen.clear()
     _draw_header(bat_str, lt)
@@ -664,12 +935,12 @@ def update():
     elif elapsed >= REFRESH_MINS:       # USB path: time-based refresh
         should_refresh = True
 
-    if _button_a_down():                # manual: also forces a weather fetch
+    if _button_a_down():                # manual: also forces weather + disruption
         should_refresh = True
         manual = True
 
     if should_refresh:
-        do_refresh(force_weather=manual)
+        do_refresh(forced=manual)
         last_refresh_minute = current_minute
 
     # ---- Draw ----
@@ -679,6 +950,10 @@ def update():
     lt = london_now()                   # UK wall-clock; header clock + footer date
 
     _draw_header(bat_str, lt)
+
+    # The alert gets its own slot near the bottom, so the y=22 status row keeps
+    # its original precedence untouched: stale > column headings (§9.18).
+    alert = alert_text()
 
     if error_msg:
         screen.font = rom_font.smart
@@ -701,8 +976,14 @@ def update():
         # Bus rows
         y = 40
         row_h = 16
+        bottom = _rows_bottom(alert)          # None unless the alert bar is up
+        _, text_h = screen.measure_text("0")  # measured, not assumed: rom_font.smart
+                                              # is proportional and its height isn't
+                                              # documented (§5.1)
         screen.pen = color.black
         for bus in buses:
+            if bottom is not None and y + text_h > bottom:
+                break                         # yield the row to the alert bar
             min_str = "Due" if bus["minutes"] == 0 else str(bus["minutes"])
             screen.text(bus["line"],        4,  y)
             screen.text(bus["destination"], 50, y)
@@ -712,6 +993,11 @@ def update():
 
         # Weather footer (hidden once stale; held through a retry burst — §8)
         _draw_weather_footer(lt)
+
+    # Alert bar last: it owns the second-to-last line outright, above whatever
+    # ran before it and above the weather footer (§9.18).
+    if alert:
+        _draw_alert(alert)
 
     # Push e-ink only when we refreshed (avoids constant redraw on USB; §5.3)
     if should_refresh:
