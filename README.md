@@ -2,9 +2,6 @@
 
 A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350) e-ink badge that turns it into a tiny live departures board for a London bus stop, with a one-line weather summary underneath.
 
-<!-- TODO: add photo of the badge running the app -->
-<!-- ![Badger 2350 running the TfL app](docs/images/badge.jpg) -->
-
 ```
 +------------------------------------------------------------+
 | 84%   TFL  Abbey Road                         08:47        |
@@ -19,6 +16,8 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 +------------------------------------------------------------+
 ```
 
+![Badger 2350 running the app, showing live Abbey Road bus arrivals with a weather line underneath](docs/images/badge.jpg)
+
 ## Features
 
 - Live arrival predictions for any TfL bus stop, refreshed every 2 minutes (configurable)
@@ -26,6 +25,7 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 - Battery-aware: deep-sleeps between refreshes, shows a voltage-derived charge percentage, and latches into a static low-battery "death screen" instead of dying on stale data which might be missed on a quick glance
 - Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time to resume live updates during quiet hours
 - Resilient weather: a failed hourly fetch is retried 3 more times over the next few minutes before the footer is dropped
+- Closure-aware: detects a TfL stop closure (a separate endpoint from arrivals), transparently fails over to a configured neighbour stop, and shows a `{stop} Closed` banner — so you never get live times for a stop no bus will pull into
 - Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes)
 - **Button A** forces an immediate refresh of both buses and weather
 
@@ -64,6 +64,7 @@ The main knobs, all at the top of `__init__.py`:
 | `WEATHER_LOCATION` | `Westminster` | wttr.in place name |
 | `WEATHER_MAX_STALE_MINS` | `60` | Weather retry interval *and* the age past which the footer is hidden |
 | `QUIET_START` / `QUIET_END` | `"22:30"` / `"05:30"` | Overnight pause window — no bus fetching, hourly heartbeat only. Set either to `None` to disable |
+| `ALT_STOP_ID` / `ALT_STOP_NAME` | `490004555P` / `Buckingham Palace Rd` | Neighbour stop to fail over to while `STOP_ID` is closed, and its (short) header label. Set `ALT_STOP_ID = None` for a closure notice with no failover |
 | `LOW_BATT_VOLTS` | `3.45` | Voltage at which the low-battery screen latches |
 
 The full list — including timeouts, the low-battery hysteresis pair, the LiPo calibration curve, and which layout values are safely tweakable — is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
@@ -85,6 +86,7 @@ The longer version — architecture, resilience behaviour, and every firmware qu
 - **Stale:** the column headers are replaced by `Stale - N min ago - press A` when a refresh fails but cached data exists. Clears on the next successful fetch.
 - **Error:** `WiFi failed / Could not fetch - press A to retry` — only when there is *no* cached data (e.g. first launch while offline).
 - **Quiet hours:** overnight (default 22:30–05:30) the table is replaced by a notice that buses are still running but the badge is asleep to conserve battery. The header clock/battery and the weather footer refresh hourly; **press A** for 30 minutes of live updates, after which it parks again.
+- **Closure:** when TfL reports `STOP_ID` closed, an inverted `{stop} Closed` banner appears above the weather line, the header retitles to `ALT_STOP_ID`, and the arrivals below are the neighbour stop's — so the times are ones you can actually act on. Clears automatically when the closure ends.
 - **Low battery:** a full-screen battery glyph with the voltage reading. The app pauses all activity, holds this image (e-ink needs no power to do so), and polls every 15 minutes for a charger. Plug in USB-C to resume.
 
 ## Dependencies

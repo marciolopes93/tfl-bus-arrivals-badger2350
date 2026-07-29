@@ -22,6 +22,10 @@ Also by design: the footer is removed once the weather data is older than `WEATH
 
 Quiet hours, working as designed: between `QUIET_START` and `QUIET_END` (default 22:30–05:30) the app stops fetching bus data to conserve battery, waking only hourly to refresh the header clock/battery and the weather footer. **Press A** for 30 minutes of normal live updates; automatic updates resume at `QUIET_END`. To disable the feature, set `QUIET_START` or `QUIET_END` to `None` (see `docs/CONFIGURATION.md`). If the badge seems parked at the *wrong* time of day, check the header clock — quiet hours follow the RTC, though they're automatically skipped when the clock looks unset (year 2000 after a full battery death).
 
+## The header names a different stop, with a "… Closed" banner
+
+By design: TfL has reported your `STOP_ID` closed. The app fails over to `ALT_STOP_ID` (named in the header) and draws an inverted `{STOP_NAME} Closed` bar above the weather line, so the arrivals shown are for the neighbour stop you can actually board at. It reverts automatically once TfL clears the closure. To keep it on your own stop and show the notice only, set `ALT_STOP_ID = None`. If a closure looks stuck on screen after the stop reopened, note the state is *held* deliberately on failed fetches and clears only on a successful all-clear — press **A** to force a fresh check. (`HANDOFF.md` §9.18)
+
 ## The clock shows 00:00 and the date says Sat 01/01
 
 The battery fully died, which resets the RTC to its year-2000 epoch (1 Jan 2000 was a Saturday). The app detects this (`year < RTC_MIN_VALID_YEAR`) and re-syncs from NTP on the next successful connection — charge it, let it refresh once, and the clock self-heals. One caveat: the NTP seed is UTC and this firmware has no local-time setter, so a recovery **during British Summer Time** reads 1 hour behind until the clock is set manually (winter recoveries are exact). (§9.13, §9.16)

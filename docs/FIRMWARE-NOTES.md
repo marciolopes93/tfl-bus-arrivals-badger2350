@@ -43,6 +43,8 @@ On v2.0.2 `battery_level()` only ever returns **100 (charging) or 0 (on battery)
 
 ## 6. The e-ink panel has two native greys — and update mode matters
 
+The panel measures **264 × 176 px** — read from `screen.width` / `screen.height`, *not* the commonly quoted 296×128, which is a different Badger's spec and cost a two-row layout error here. `rom_font.smart` glyphs measure **6 × 12 px** (`screen.measure_text("0")`). Prefer `screen.measure_text()` over arithmetic in layout code. (§5.9)
+
 The panel renders four levels: black, dark grey, light grey, white; any pen colour is *quantized* to the nearest. In the DawnBringer-16 palette, `color.grey` is the **dark** grey and `color.smoke` (≈ `color.rgb(160–190, …)`) is the **light** one. There is no `color.light_grey` — that was a v4 name. Crucially, greys render cleanly only under `MEDIUM_UPDATE`/`FULL_UPDATE`; the default fast update muddies them toward black, which is why naive grey fills appear solid black. Dithering is only needed for shades *beyond* the two native greys. (§5.8, §9.7, §9.15)
 
 ## 7. Drawing API changes from v4

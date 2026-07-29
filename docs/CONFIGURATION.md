@@ -34,6 +34,17 @@ Inside the window the app does no bus fetching at all — roughly 28 fetch cycle
 
 On USB power the badge never deep-sleeps, so quiet hours still show the parked screen but the loop keeps spinning; the heartbeat gate prevents e-ink churn. Battery conservation is irrelevant on USB, so if you dock the badge overnight and would rather it stay live, set either bound to `None`.
 
+## Stop closures
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `ALT_STOP_ID` | `490004555P` | The neighbour stop arrivals fail over to while `STOP_ID` is reported closed. Set to `None` to keep the closure banner but stay on `STOP_ID` (notice-only). Pick a nearby stop on the same route and direction — ideally the next one downstream, so its later arrival times already price in the walk. |
+| `ALT_STOP_NAME` | `Buckingham Palace Rd` | Header label shown while failed over. Keep it short — it shares the header bar with the clock and battery meter (~20 chars). |
+| `DISRUPTION_MAX_STALE_MINS` | `60` | How often the closure endpoint is polled — hourly, on the same slot as weather, never the 2-minute bus cycle. Closures change on a scale of days, so this is ~24 extra requests a day. |
+| `DISRUPTION_RETRY_BURST` | `3` | Extra per-wake retries after a failed closure fetch. Unlike its weather counterpart this drives **retries only, never expiry**: a failed fetch holds the last known closure indefinitely, and only a successful all-clear clears it — so the badge can never silently stop warning you about a stop you can't board at. |
+
+TfL publishes stop closures on a *separate* endpoint from arrivals, so a stop can be shut while `/Arrivals` still serves times for it. When an active closure is reported the app redirects the arrivals fetch to `ALT_STOP_ID`, retitles the header, and shows a `{STOP_NAME} Closed` banner above the weather line; a later all-clear puts everything back. Full rationale in `HANDOFF.md` §9.18.
+
 ## Network
 
 | Variable | Default | Notes |
@@ -73,7 +84,7 @@ While charging, the meter shows `chg` instead of a percentage — the charger ho
 
 ## Layout values (hardcoded but tweakable)
 
-These aren't surfaced as constants because they're coupled to the 296×128 layout, but they're safe to nudge:
+These aren't surfaced as constants because they're coupled to the 264×176 panel layout, but they're safe to nudge:
 
 - Destination names truncate at 23 characters (`fetch_arrivals`), the weather footer's left side at 28, both with a `~` suffix.
 - Row height is 16 px from y=40; columns sit at x=4 (line), x=50 (destination), right-aligned (minutes).
