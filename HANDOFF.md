@@ -36,7 +36,7 @@ refining behaviour and polish.
 |------|-------|
 | Device | Pimoroni Badger 2350 |
 | Firmware | **Badgeware v2.0.2** |
-| Display | e-ink, 296 x 128 region used (264x176 panel) |
+| Display | e-ink, **264 x 176** — measured on-device, not the 296x128 spec figure (§5.9) |
 | Dev tool | Thonny on macOS (MicroPython / Raspberry Pi Pico interpreter) |
 | Connection | USB-C; **must use a data cable, not charge-only** |
 | Docs | https://badgewa.re/docs and https://github.com/pimoroni/badgeware-docs |
@@ -271,6 +271,20 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 `futile`, `ignore`, `nope`, `sins`, `smart`, `yesterday`. **We use
 `rom_font.smart`** everywhere (small, readable). v2.x fonts now support UTF-8.
 
+**Measured metrics (do not trust the spec sheet).** The panel and the font were
+read off the device, per the §5.1 house rule:
+
+```python
+>>> print(screen.width, screen.height, screen.measure_text("0"))
+264 176 (6.0, 12.0)
+```
+
+So: **264 x 176 panel, 6 x 12 px glyphs.** The commonly quoted "296 x 128" is the
+2.9" Badger spec and does not apply to this board — a §9.18 layout estimate built
+on it came out wrong by two bus rows. The evidence was already in the code:
+`draw_low_battery()` draws text at `y = 146`, which a 128px panel could not
+render. Prefer `screen.measure_text()` over arithmetic in new layout code.
+
 ---
 
 ## 6. APIs used
@@ -278,11 +292,32 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 ### TFL Unified API (buses)
 - Endpoint: `https://api.tfl.gov.uk/StopPoint/{STOP_ID}/Arrivals`
 - **STOP_ID = `490003028E`** (the configured stop; STOP_NAME = "Abbey Road").
+  Set this to your own stop's Naptan ID — the trailing letter distinguishes
+  direction / side of road.
 - No API key required. Limits: 50 req/min unauthenticated; at a 2-min refresh we
   make ~30 req/hour. Optional future key: `api-portal.tfl.gov.uk`, append
   `?app_key=KEY`.
 - Fields per arrival: `lineName`, `destinationName`, `timeToStation` (secs →
   integer-divide by 60 for minutes). Sorted ascending by minutes.
+
+### TFL Unified API (stop disruptions / closures) — §9.18
+- Endpoint: `https://api.tfl.gov.uk/StopPoint/{STOP_ID}/Disruption`
+- **Separate from Arrivals.** Arrivals has no idea whether the stop is open and
+  will happily serve times for a closed one. This is the only place the closure
+  appears.
+- No API key. Returns a JSON **list** — `[]` when there is nothing wrong. Polled
+  hourly (not every 2 min), so ~24 extra requests/day.
+- Fields: `type` (`"Closure"` is the actionable one), `description` (prose,
+  formatted for a web page — embedded newlines and indentation), `fromDate` /
+  `toDate` (ISO-8601 window), `commonName`, `appearance`.
+- Live example (July 2026 roadworks):
+  ```json
+  [{"atcoCode":"490003028E","fromDate":"2026-07-27T07:00:00Z",
+    "toDate":"2026-08-09T17:00:00Z","type":"Closure","mode":"bus",
+    "description":"Bus Stop Closed\n    Please use the next stop\n      or the previous stop \n       to catch your bus",
+    "commonName":"Abbey Road","appearance":"Information"}]
+  ```
+
 
 ### wttr.in (weather)
 - **Use HTTP, not HTTPS** — HTTPS fails on the Badger
@@ -300,14 +335,15 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 
 ```
 +------------------------------------------------------------+
-| 84%   TFL  Abbey Road                        08:47  |  <- header bar (black bg, white text)
+| 84%   TFL  Abbey Road                 08:47  |  <- header bar (black bg, white text)
 |------------------------------------------------------------|
 | Line   Destination                              Min        |  <- col headers (y=22)
 | ---------------------------------------------------------- |  <- separator line (y=36)
 | 18     Euston                                     2        |  <- rows from y=40, row_h=16
 | 27     Camden Town                                5        |     plain black-on-white
 | ...                                                        |
-| ---------------------------------------------------------- |
+|############  Abbey Road Closed  #####################|  <- closure alert bar (§9.18; only while
+| ---------------------------------------------------------- |     closed. Header then names the alt stop)
 | Sat. 30/05: Partly cloudy            12C (9, 18)           |  <- weather footer (removed when >1h old)
 +------------------------------------------------------------+
 ```
@@ -337,6 +373,16 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
   wide for the panel in one), then a gap, `Auto-updates resume at 05:30.`
   (rendered from `QUIET_END`), a gap, and `Press A for an update now.`
   Repainted once per `QUIET_SLEEP_MINS` heartbeat, not per wake.
+- **Closure alert bar** (§9.18): while the stop is closed, an inverted
+  (white-on-black) centred bar sits on the **second-to-last line**, directly on
+  top of the weather rule — and drops to the bottom line when the footer is
+  hidden, so it never leaves a gap. Reads `{STOP_NAME} Closed`, naming the stop
+  that is **shut**, while the header names the stop the arrivals actually came
+  from. The two lines together are the whole story: what you're looking at, and
+  why it changed. `ALERT_H = 18`, chosen on the panel (at 15 the text sat low with
+  dead rows above it); it matches the header bar, so the two read as a pair. All
+  six bus rows still fit alongside it — see the budget in §9.18.
+
 - **Weather footer**: `{Day}. {dd}/{mm}: {condition}` left (truncated to 28 chars
   with `~`), `{temp}C ({lo}, {hi})` right-aligned. The left label shows **today's
   date** from `london_now()` (a localtime-style tuple `(year, month, mday, hour,
@@ -348,9 +394,23 @@ taupe, blue, orange, smoke, lime, latte, cyan, yellow, white`, plus
 > Layout note: because `screen.text` y is now top-left (§5.7), if anything ever
 > looks vertically off after a change, nudge the y values — it won't crash.
 
+> **Header text y = 2, not 3.** With an 18px bar and a 12px glyph, y=3 is
+> arithmetically centred — but `rom_font.smart` renders with a pixel or two of
+> built-in padding above the glyph, so 3 sits visibly low. On-device, **2** looks
+> right. All three header `screen.text(...)` calls in `_draw_header()` (battery,
+> title, clock) use the same value and must be changed together. `_draw_alert()`
+> uses `top + 2` for the same reason, so the two bars agree.
+
 ---
 
 ## 8. Refresh & resilience behaviour
+
+- **Stop closures (§9.18).** The disruption endpoint is polled on the same hourly
+  slot as weather (and forced by a press of **A**), never on the 2-min bus cycle.
+  Its failure handling is the **inverse** of weather's: a failed fetch holds the
+  last known closure indefinitely and only a clean empty response clears it, so the
+  device can never quietly stop warning you about a stop you can't board at. The
+  retry-burst counter drives retries only, never expiry.
 
 - **REFRESH_MINS = 2.** TFL predictions are minute-precision; 2 min halves
   WiFi/display cost vs 1 min while staying useful. Press **A** for an instant
@@ -607,6 +667,159 @@ The hard-won specifics, so we don't repeat them:
 
 ---
 
+### 9.18 TFL publishes stop closures on a *different* endpoint (+ failover)
+
+**Symptom.** During roadworks near the stop the countdown unit at the home stop
+showed a fault, the TFL website showed live arrivals *under a closure banner*,
+and the Badger showed the same arrivals with **no banner at all** — the one
+consumer of the three that was silently wrong. Times for a stop
+no bus will pull into are worse than no times, because they read as actionable.
+
+**Cause.** `/StopPoint/{id}/Arrivals` has no notion of whether the stop is open.
+The closure lives on a separate endpoint, `/StopPoint/{id}/Disruption` (§6), which
+nothing in the app was calling.
+
+**Fix.** Poll the disruption endpoint on the **hourly weather cadence** — closures
+change on a scale of days, so ~24 extra GETs/day against ~720 bus fetches is noise
+against `REFRESH_MINS`, the actual battery lever (§8). When an active `Closure` is
+reported, redirect `fetch_arrivals()` to `ALT_STOP_ID`, retitle the header, and
+draw the alert bar (§7). A successful empty response puts everything back.
+
+`active_stop()` is the single source of truth for the failover — arrivals, the
+header and the alert text all read it, so they cannot disagree about which stop is
+on the panel.
+
+#### The fail-safe runs the OPPOSITE way to weather
+
+Weather degrades gracefully: a failed fetch eventually drops the footer, because a
+missing footer is honest and a stale one isn't (§8). **Closure state must not
+degrade.** A failed fetch *holds* the last known closure indefinitely; only a
+successful `[]` clears it. The cost of wrongly holding is a walk to a stop that
+reopened; the cost of wrongly dropping is standing at a closed one. Asymmetric, so
+the code is asymmetric.
+
+`disruption_fails` therefore drives **only the retry burst** (re-fetch every wake
+while `1..DISRUPTION_RETRY_BURST`), never expiry — the mirror image of
+`weather_fails`, which does drive expiry. `disruption` and `disruption_type` are
+written on the success path *only*.
+
+#### ISO dates compare correctly as plain strings
+
+`fromDate` / `toDate` are ISO-8601, and ISO-8601 sorts lexically. So the window
+check is a string compare of the `YYYY-MM-DD` prefix against a formatted
+`rtc.datetime()` — no date parsing on MicroPython at all:
+
+```python
+if len(frm) >= 10 and today < frm[:10]: return False
+if len(to)  >= 10 and today > to[:10]:  return False
+```
+
+`_window_active()` **fails open** in every ambiguous case. Critically it returns
+`True` when `clock_valid()` is False: after a full battery death the RTC reads its
+2000 epoch, which would compare as "before every `fromDate`" and silently suppress
+a live closure — the §9.13 failure mode leaking into a new subsystem. Same
+reasoning as the quiet-hours clock guard (§9.17).
+
+#### The bar went below the table, and costs nothing
+
+It sits on the second-to-last line rather than in the y=22 status slot, so the
+Line/Destination/Min headings survive and the arrivals still read as a table. The
+y=22 slot therefore keeps its original precedence untouched — `Stale …` > headings
+(§7) — and the two messages never compete. They say different things: *don't go
+there* vs *don't trust these numbers*.
+
+Vertical budget with a closure showing, on the real 264x176 panel (§5.9):
+
+| Element | y | Height |
+|---|---|---|
+| header bar | 0 | 18 |
+| heading row (y=22) + rule (y=36) | 18 | 22 |
+| 6 bus rows @ 16px | 40 | 96 (ends 136) |
+| *slack* | 136 | 4 |
+| alert bar | 140 | 18 |
+| weather rule + footer | 158 | 18 (ends 176) |
+
+Everything fits with 4px to spare, so **no bus rows are lost**. Horizontally
+there's more room still: at 6px/char `Abbey Road Closed` is ~100px in a 264px
+bar, and any longer name is `_fit()`-truncated to fit.
+
+> **Correction.** The first draft of this section claimed the bar cost 2–3 bus
+> rows. That was derived from an assumed 296x128 panel and was wrong — see §5.9.
+> Measure, don't calculate.
+
+`_rows_bottom()` remains as a **safety net**, not a design constraint: it never
+fires at the current geometry. It exists so a future `MAX_BUSES` bump, a taller
+`ALERT_H` or a wider font degrades by dropping the last row rather than by drawing
+bus times underneath a black bar. It reads `screen.measure_text("0")` for row
+height rather than assuming one. It only clamps while the bar is up, so the normal
+screen is byte-for-byte the layout it always was.
+
+#### Wording: the bar names the closed stop, the header names the live one
+
+`alert_text()` returns `"Abbey Road Closed"` while the header reads
+`TFL  Buckingham Palace Rd`. Putting the alt stop's name in both would have said the same
+thing twice and left the closure unexplained.
+
+`_fit()` is applied to the **name only**, against the width left after `" Closed"`
+is measured. Trimming the whole string risks a cut like `Long Stop Name Clos~`,
+losing the one word that matters.
+
+TFL's own `description` is deliberately **not** shown on a closure: at 6px/char it
+is 456px against a 264px panel, and its advice ("use the next stop or the previous
+stop") is already spent — the panel is showing that stop. Non-closure notices are
+rarer and unmodelled, so those pass TFL's text straight through, `_fit()`-truncated.
+
+#### Choosing the alternate stop
+
+`ALT_STOP_ID` should be a nearby stop on the same route and direction you can
+walk to. Prefer the **next** stop downstream: it's usually closest, and because
+its arrival times are *later* than the home stop's, the walk is already priced
+into the number on screen — walking to the *previous* stop inverts that, leaving
+you chasing a time that's already elapsing. Confirm your chosen alt is itself
+clear (a `[]` from its own `/Disruption`) before relying on it.
+
+**Trap:** the two directions of one physical stop pair have Naptan IDs that
+differ only in the trailing letter and share a parent `490G…` code. The
+opposite-direction ID is **not** a usable neighbour — don't let a lookup that
+resolves via the parent stop hand you the wrong side of the road.
+
+#### Behaviour matrix
+
+| Situation | Arrivals from | Header | y=22 row | Alert bar |
+|---|---|---|---|---|
+| Normal | `STOP_ID` | Abbey Road | Line / Destination / Min | — |
+| Active closure | `ALT_STOP_ID` | Buckingham Palace Rd | Line / Destination / Min | `Abbey Road Closed` |
+| Closure + stale buses | `ALT_STOP_ID` | Buckingham Palace Rd | `Stale - 7 min ago - press A` | `Abbey Road Closed` |
+| Closure, fetch failing | `ALT_STOP_ID` (held) | Buckingham Palace Rd | as above | held until a clean `[]` |
+| Closure, no arrivals at all | — | Buckingham Palace Rd | `Could not fetch` at y=40 | still drawn |
+| Non-closure notice | `STOP_ID` | Abbey Road | Line / Destination / Min | TFL's text, truncated |
+| `ALT_STOP_ID = None` | `STOP_ID` | Abbey Road | Line / Destination / Min | `Abbey Road Closed` |
+| Quiet hours | not fetched | per `active_stop()` | — | not drawn |
+| Post battery death | `ALT_STOP_ID` if reported | — | — | shown; window check fails open |
+
+Quiet hours deliberately don't surface the alert: the heartbeat doesn't fetch
+disruption, so anything drawn could be a night old, and normal refreshes resume at
+`QUIET_END` regardless (§9.17).
+
+#### Ordering inside `do_refresh()`
+
+Disruption is fetched **before** arrivals. Running it second would leave the panel
+one cycle behind the closure — showing the closed stop's times under a "closed"
+bar.
+
+#### Verification
+
+**Validated on-device:** all six bus rows render alongside the bar and the weather
+line; `ALERT_H = 18` centres the text; `Abbey Road Closed` renders in full,
+centred, no truncation; the panel and font metrics were read from the REPL (§5.9).
+
+**Still pending (§12):** ghosting when the bar clears (only observable at the end
+of a real closure); the automatic return to `STOP_ID` when the closure expires;
+whether the extra hourly GET pushes the awake window past `AWAKE_MS`.
+
+---
+
+
 ## 10. Config knobs (top of `__init__.py`)
 
 `STOP_ID`, `STOP_NAME`, `MAX_BUSES`, `REFRESH_MINS`, `WEATHER_MAX_STALE_MINS`,
@@ -620,6 +833,20 @@ interval; §8 / §9.14), and the quiet-hours quartet `QUIET_START` / `QUIET_END`
 ("HH:MM" strings; set either to `None` to disable) / `QUIET_SLEEP_MINS`
 (heartbeat + chunk length) / `QUIET_OVERRIDE_MINS` (press-A live window; §8 /
 §9.17).
+
+The stop-closure set (§9.18): `ALT_STOP_ID` (the stop arrivals fall over to while
+closed; set to `None` for notice-only, no failover) / `ALT_STOP_NAME` (header
+title while failed over — keep it short, it shares the bar with the clock and
+battery) / `DISRUPTION_MAX_STALE_MINS` (hourly re-check cadence) /
+`DISRUPTION_RETRY_BURST` (extra per-wake retries after a failed fetch — drives
+retries **only**, never expiry, unlike its weather counterpart).
+
+Layout constants near the drawing helpers rather than in the config block:
+`ALERT_H` (alert bar height, 18 — set on the panel, not by arithmetic; §9.18),
+`FOOTER_RULE_Y` (distance from the panel bottom to the weather rule, 18 — equal to
+`ALERT_H` by coincidence, named so a future tweak doesn't conflate them) and
+`ALERT_SUFFIX` (`" Closed"`, appended to `STOP_NAME` and never truncated).
+
 
 Also tweakable in code (not config-block constants): destination names truncate
 at 23 characters in `fetch_arrivals()` (`[:22] + "~"`; widened from 20), and the
@@ -669,6 +896,25 @@ darkens.
   fires (only ≤2-min alarms are battle-tested so far); (c) one full unattended
   night, confirming the parked screen holds, the hourly heartbeat repaints, and
   live updates resume at `QUIET_END`.
+- **Finish validating the closure failover on-device (§9.18).** Layout and
+  wording are confirmed (six rows fit, `ALERT_H = 18`, no truncation). Three
+  checks remain: (a) **ghosting** — the alert bar appears and disappears
+  mid-session over a region that otherwise holds bus rows; watch the transition
+  when it clears and force `FULL_UPDATE` if it ghosts (the §9.15 pattern);
+  (b) the **automatic return** to `STOP_ID` when the closure expires — confirm the
+  header and arrivals switch back on the *same* cycle, and that the reclaimed rows
+  redraw rather than leaving the bar's footprint; (c) whether the extra hourly GET
+  pushes the awake window past `AWAKE_MS`.
+- **Also check the alt stop's own disruption (§9.18).** If both stops close, the
+  app fails over into a second closed stop, silently. One more GET on the same
+  hourly slot; untested against a real double-closure, so not built.
+- **Auto-resolve the neighbouring stop** from `/Line/{id}/Route/Sequence` instead
+  of a hardcoded `ALT_STOP_ID`. Considered and rejected: the sequence payload is
+  large for this much RAM and the answer changes roughly never. Noted in case the
+  stop is ever reconfigured.
+- **Sweep for stale `296x128` references.** The panel is 264x176 (§5.9). Fixed in
+  §2, §5.9 and §9.18; check `README.md` and `docs/` too.
+
 - **Outage backoff (future release).** During a WiFi outage every 2-min wake
   burns ~10 s of radio in `connect_wifi()` — the most expensive failure mode
   left. Persist a consecutive-failure counter and stretch the sleep (e.g. 5 then
