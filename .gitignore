@@ -12,3 +12,7 @@ __pycache__/
 
 # Claude Code local settings (personal, not shared)
 .claude/settings.local.json
+
+# Raw image sources (heavyweight originals; optimised versions live in docs/images/)
+hf_*.png
+*_crop_center.webp
