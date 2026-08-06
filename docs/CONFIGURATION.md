@@ -57,7 +57,7 @@ TfL publishes stop closures on a *separate* endpoint from arrivals, so a stop ca
 |----------|---------|-------|
 | `RTC_MIN_VALID_YEAR` | `2024` | If the RTC reports a year below this, the clock is treated as wiped (a full battery death resets it to the year-2000 epoch) and an NTP re-sync is triggered on the next successful connection. Normal wakes never touch NTP. |
 
-Known limitation: the NTP seed is UTC and this firmware has no setter to write a corrected local time, so a battery death recovered during British Summer Time leaves the clock 1 hour behind until set manually. Winter recoveries are correct. Details in `HANDOFF.md` §9.16.
+Timezone model: the RTC stores **UTC** and UK local time is derived at read time in `london_now()`, which adds +1h during British Summer Time (01:00 UTC on the last Sunday of March to 01:00 UTC on the last Sunday of October). There are no timezone knobs to set — the BST rule is automatic, so both the twice-yearly clocks-change and a battery-death NTP recovery are correct year-round with no manual intervention. The first run of this build over an older install performs a one-time re-seed to UTC (`migrate_rtc_to_utc_if_needed()`, latched in `persist["utc_migrated"]`). Details in `HANDOFF.md` §9.16.
 
 ## Low-battery behaviour
 

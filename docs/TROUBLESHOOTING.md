@@ -28,11 +28,16 @@ By design: TfL has reported your `STOP_ID` closed. The app fails over to `ALT_ST
 
 ## The clock shows 00:00 and the date says Sat 01/01
 
-The battery fully died, which resets the RTC to its year-2000 epoch (1 Jan 2000 was a Saturday). The app detects this (`year < RTC_MIN_VALID_YEAR`) and re-syncs from NTP on the next successful connection — charge it, let it refresh once, and the clock self-heals. One caveat: the NTP seed is UTC and this firmware has no local-time setter, so a recovery **during British Summer Time** reads 1 hour behind until the clock is set manually (winter recoveries are exact). (§9.13, §9.16)
+The battery fully died, which resets the RTC to its year-2000 epoch (1 Jan 2000 was a Saturday). The app detects this (`year < RTC_MIN_VALID_YEAR`) and re-syncs from NTP on the next successful connection — charge it, let it refresh once, and the clock self-heals. Since this build stores **UTC** in the RTC and derives UK local time at read time, the recovery is now exact year-round — the old "1 hour behind during BST" caveat is gone. (§9.13, §9.16)
 
 ## The clock is exactly 1 hour off
 
-Either the BST caveat above, or — if you've modified the code — an added timezone offset. Don't add one: the RTC on this firmware holds UK **local** time, so `time.localtime()` is already correct; offsetting it double-counts the hour in summer. (§9.16)
+On this build the RTC stores **UTC** and `london_now()` adds the BST offset at read time, so a persistent one-hour error almost always means one of:
+
+- **The one-time UTC migration hasn't run yet.** The first time you flash this build over an older (local-time) install, it re-seeds the RTC to UTC on the first refresh that gets WiFi up, then latches `persist["utc_migrated"]`. If that first refresh couldn't reach WiFi/NTP, the old local value is briefly read as if it were UTC and shows +1h until the next successful refresh. Press A (or wait for WiFi) and it corrects itself.
+- **You added a second offset.** Don't apply a timezone offset anywhere except inside `london_now()` — every other read is already local. Adding one in display code, or reading `rtc.datetime()` (which is now UTC) and treating it as local, double-counts.
+
+The twice-yearly clocks-change (last Sunday of March / October) needs **no** action on this build — `london_now()` recomputes the offset from the UTC instant on every read, so the switch happens on its own. (§9.16)
 
 ## The screen is frozen on old data and the button does nothing
 

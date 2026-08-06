@@ -26,7 +26,7 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 - Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time to resume live updates during quiet hours
 - Resilient weather: a failed hourly fetch is retried 3 more times over the next few minutes before the footer is dropped
 - Closure-aware: detects a TfL stop closure (a separate endpoint from arrivals), transparently fails over to a configured neighbour stop, and shows a `{stop} Closed` banner — so you never get live times for a stop no bus will pull into
-- Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes)
+- Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes), and keeps the right UK time all year: it stores UTC and applies British Summer Time automatically, so the spring/autumn clock change needs no intervention
 - **Button A** forces an immediate refresh of both buses and weather
 
 ## Hardware & firmware requirements

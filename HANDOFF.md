@@ -189,24 +189,26 @@ State.save("tfl", persist)   # save after changes
   battery every wake is a fresh module load, so this runs each cycle; (b) inside
   the arm retry before each `set_alarm`; and (c) in `on_exit()`.
 - `rtc.rtc_to_localtime()` — copies the RTC (which keeps running through sleep)
-  into the system clock. We call it once at startup so `time.localtime()` (used
-  for the header clock and footer date) is correct after a sleep/reset.
+  into the system clock. We call it at startup and after an NTP re-seed. With the
+  RTC now on UTC, the system clock (`time.localtime()` with no arg) is UTC too;
+  the app never displays it directly — all display goes through `london_now()`.
 - `rtc.time_from_ntp()` — fetches the time over the network and sets the RTC to
-  **UTC**. We only call it when the RTC looks unset (`datetime()[0] < RTC_MIN_VALID_YEAR`),
-  i.e. after a full battery death wiped it to the 2000 epoch (§9.13). Needs WiFi
-  up first (a bare-REPL call with no connection raises `OSError -6` from inside
-  `ntptime.py`).
-- **The RTC normally runs on UK LOCAL time, not UTC.** Confirmed on-device:
-  `rtc.datetime()` reads the wall clock (e.g. 23:20 when London is 23:20 BST), and
-  the original app displayed `time.localtime()` straight and was correct for
-  months. So the display applies **no** timezone offset — `london_now()` is just
-  `time.localtime()`. An earlier version of this doc/code wrongly assumed the RTC
-  was UTC and added a BST offset at display time; that double-counted the hour in
-  summer (§9.16). **Caveat — the one place UTC leaks in:** `time_from_ntp()`
-  returns UTC, and there's **no `set_datetime()`** on this firmware (`dir(rtc)`
-  shows only `set_alarm`/`set_timer` as setters), so the death-recovery re-seed
-  (§9.13) leaves the RTC on UTC — correct in winter, 1h behind during BST until
-  manually fixed. Open item in §9.16 / §12.
+  **UTC**. Called in two places: when the RTC looks unset (`datetime()[0] <
+  RTC_MIN_VALID_YEAR`) after a full battery death (§9.13), and once by
+  `migrate_rtc_to_utc_if_needed()` to move an old local-time install onto the UTC
+  model. Needs WiFi up first (a bare-REPL call with no connection raises
+  `OSError -6` from inside `ntptime.py`).
+- **The RTC stores UTC; UK local time is derived at read time.** `london_now()`
+  is the single seam: it reads `rtc.datetime()` (UTC), adds +1h when `_is_bst()`
+  says British Summer Time, and returns a `time.localtime()`-style tuple. Every
+  wall-clock consumer in the app calls it — so nothing else ever applies an
+  offset, and reading `rtc.datetime()` directly (as `clock_valid()` does for the
+  year) gives UTC by design. This replaced an earlier local-time-in-RTC model;
+  the full reasoning, the failed intermediate attempt, and why UTC storage is the
+  correct fix are in §9.16. The two payoffs: a battery-death NTP recovery is now
+  exact year-round (NTP's UTC *is* the stored value — no offset to double-count),
+  and the March/October clocks-change needs no re-sync because the offset is
+  recomputed from the UTC instant on every read.
 
 ### 5.5 Buttons (`badge`)
 `io` is gone — it's now `badge`. Test a button with `badge.pressed(BUTTON_A)`
@@ -352,8 +354,8 @@ render. Prefer `screen.measure_text()` over arithmetic in new layout code.
   The meter shows a voltage-derived `%` on battery, or `"chg"` while charging
   (see §5.6 / §9.10 — `battery_level()` is unusable, so we map `battery_voltage()`
   through a LiPo curve). Just the meter, no "LOW" text. The clock and footer date
-  are drawn from `london_now()`, which on this firmware is simply `time.localtime()`
-  — the RTC already runs on UK local time, so no offset is applied (§5.4 / §9.16).
+  are drawn from `london_now()`, which reads the UTC RTC and applies the BST
+  offset at read time — the single timezone seam (§5.4 / §9.16).
 - **Bus rows are now plain black text on white** — the old zebra/alternating-row
   shading was removed (it relied on a grey that the e-ink rendered as solid black;
   see §9). The display is clean without it, and being pure black/white means no
@@ -549,12 +551,10 @@ The hard-won specifics, so we don't repeat them:
     `rtc.time_from_ntp()` (the unused method from §5.4) once WiFi is up, gated on
     the RTC year looking unset (`< RTC_MIN_VALID_YEAR`) so normal deep-sleep wakes
     skip it. The sync is self-healing — a failed NTP attempt leaves the clock unset
-    and retries next refresh. **Correction (see §9.16):** an earlier version of this
-    entry concluded the RTC should be kept on UTC with a BST offset applied at
-    display time. That was wrong — the RTC normally runs on **local** time, so the
-    display must NOT offset. The remaining wrinkle is only here in recovery:
-    `time_from_ntp()` seeds **UTC** and there's no setter to write a corrected local
-    value, so a death recovered during BST reads 1h behind until fixed (§9.16 / §12).
+    and retries next refresh. **Resolved (see §9.16):** the app now stores **UTC** in
+    the RTC and derives UK local time at read time in `london_now()`. Because NTP's
+    seed is UTC — exactly the stored model — the recovery is correct year-round; the
+    earlier "1h behind during BST after a recovery" wrinkle no longer exists.
 14. **Low-battery pause ("death screen").** To stop the device draining its last
     charge into doomed refreshes (and to avoid the §9.13 brownout-mid-refresh
     blanking), the app latches into a paused state at/below `LOW_BATT_VOLTS` on
@@ -601,27 +601,41 @@ The hard-won specifics, so we don't repeat them:
     light grey. Lesson reinforced (§9.11): the device + the *official* source beat
     a guessed pile of modes — should have read the colour docs before chasing
     `mode()` flags.
-16. **Clock showed +1h in summer — the display BST offset was a regression.**
-    Symptom: header read `Mon 00:13` when it was really `Sun 23:13` BST. Cause: the
-    §9.13 clock work assumed the RTC was UTC and added a UK BST offset at display
-    time (`london_now()` + a last-Sunday BST rule). But the RTC actually runs on
-    **local** time — confirmed on-device: `rtc.datetime()` → `(2026, 6, 7, 23, 20,
-    21, 6)` while London was 23:20, and the original app displayed `time.localtime()`
-    straight and was right for months. So the offset double-counted the hour
-    whenever the UK is on BST. Fix: drop the offset entirely — `london_now()` is now
-    just `time.localtime()`, and the `_dow`/`_last_sunday`/`_uk_is_bst` helpers were
-    deleted (recoverable from git history if ever needed). The mistaken assumption
-    came from the §9.13 NTP test, which only showed what `time_from_ntp()` *returns*
-    (UTC), not what the RTC normally *holds* (local). Lesson (again, §9.11): read
-    the actual RTC value before designing around it.
-    **Still open — death-recovery during BST (§5.4 / §12):** because `time_from_ntp()`
-    seeds UTC and there's no `set_datetime()` to write local back, a full battery
-    death recovered in summer leaves the clock 1h behind until corrected (winter is
-    fine; UTC == local). Not yet fixed — it needs a tested way to write a
-    BST-corrected local time into the RTC (candidate: `localtime_to_rtc()` after
-    nudging the system clock +1h; unverified on this firmware, so not attempted).
-    Low impact: only triggers on a full death in BST, and the date/approx-time is
-    still far better than staying stuck at the 2000 epoch.
+16. **Timezone: RTC stores UTC, UK local is derived at read time.** This entry has
+    a two-step history; the current design is at the bottom.
+
+    *Attempt A (regression).* The §9.13 clock work assumed the RTC was UTC and added
+    a UK BST offset at display time. It read `Mon 00:13` when it was really `Sun
+    23:13` BST — the offset double-counted, because the RTC at that time was holding
+    **local** wall-clock (`rtc.datetime()` → `(2026, 6, 7, 23, 20, 21, 6)` while
+    London was 23:20). That offset was dropped.
+
+    *Attempt B (local-only).* `london_now()` became just `time.localtime()`, no
+    offset — correct while the RTC held local time. But it left a genuine hole:
+    (a) a full battery death re-seeds from NTP, which returns **UTC**, and with no
+    `set_datetime()` on this firmware to write a corrected local value back, a
+    summer recovery read 1h behind until fixed by hand; and (b) nothing handled the
+    twice-yearly clocks-change during normal running — after the October switch a
+    still-alive badge would run an hour fast until a death or a manual fix, because
+    the app only ever re-syncs on the death path.
+
+    *Current design (fixes both).* **Store UTC in the RTC; convert to UK local at
+    read time.** `london_now()` reads `rtc.datetime()` (now UTC), adds +1h when
+    `_is_bst()` says British Summer Time, and returns a `time.localtime()`-style
+    tuple; every wall-clock consumer goes through it. `_is_bst()` decides from the
+    **UTC** instant — +1h from 01:00 UTC on the last Sunday of March to 01:00 UTC on
+    the last Sunday of October — using `_last_sunday()` (weekday of the 31st), so no
+    hard-coded calendar. This is coherent where Attempt A was not: Attempt A applied
+    an offset *on top of* an RTC that already held local time (double count); here
+    the RTC holds UTC, so exactly one offset is applied, in one place. Both holes
+    close: an NTP recovery is exact year-round (NTP's UTC *is* the stored value), and
+    the March/October switch needs no re-sync because the offset is recomputed each
+    read. **Migration:** `migrate_rtc_to_utc_if_needed()` re-seeds the RTC from NTP
+    once on the first WiFi-up refresh of this build and latches
+    `persist["utc_migrated"]`, moving an old local-time install onto the UTC model.
+    Lesson retained from Attempt A (§9.11): the fix is
+    correct *because* it's designed around what the RTC actually holds — now made
+    unambiguous by writing UTC ourselves rather than inferring it.
 17. **Quiet hours (overnight pause) — design decisions.** Implemented per §8;
     the non-obvious choices, for when this needs touching:
     - **Gate order:** low battery first (safety wins), then quiet hours, then the
@@ -936,10 +950,13 @@ darkens.
   screen is a battery glyph with a black "remaining" sliver, light-grey "empty"
   cells (`color.smoke` under `FULL_UPDATE`; §9.15) and the reading centred inside.
 - Optional: register a TFL app key if usage ever scales.
-- **Death-recovery clock during BST reads 1h behind (§9.16).** `time_from_ntp()`
-  seeds UTC and there's no `set_datetime()` to write local back. Low impact (only
-  after a full battery death, in summer). Fix would need a tested local-write path
-  (candidate: `localtime_to_rtc()` after a +1h nudge) — verify on-device first.
+- **DONE — death-recovery clock during BST (§9.16).** Resolved by storing UTC in
+  the RTC and deriving UK local time at read time in `london_now()`, so NTP's UTC
+  seed needs no local-write path at all. Also removed the twice-yearly
+  clocks-change gap (the offset is recomputed each read). A one-time
+  `migrate_rtc_to_utc_if_needed()` re-seeds old local-time installs. **Pending
+  on-device confirmation:** watch the first live BST↔GMT switch (next: last Sunday
+  of October) and the next battery-death recovery land correct without a manual fix.
 
 ### 12.1 Proposed cleaner wake mechanism: `badge.sleep()` (deferred)
 
