@@ -148,6 +148,10 @@ persist = {
     "disruption_fails":  0,
     "low_power":  False,       # latched low-battery pause state
     "quiet_override_at": None, # "HH:MM" A was pressed during quiet hours (§9.17)
+    "utc_migrated": False,     # one-time: RTC moved from the old LOCAL-time model
+                               # to UTC (§9.16). Latched after the first NTP re-seed
+                               # so migration never repeats. Absent in old State
+                               # files, so a first run of this build defaults False.
 }
 State.load("tfl", persist)
 
@@ -237,40 +241,98 @@ def battery_str_from(charging, volts):
     return "{}%".format(_pct_from_voltage(volts))
 
 # ---- Clock / timezone ------------------------------------------------------
-# The RTC runs on UK LOCAL time (confirmed on-device: rtc.datetime() reads the
-# wall clock, not UTC), and keeps it off the LiPo through deep sleep. So we just
-# display time.localtime() — NO display-time offset (an earlier BST offset here
-# double-counted the hour in summer; §9.16). A FULL battery death still wipes the
-# RTC to its 2000 epoch; sync_clock_if_needed() re-seeds it (see its note + §9.16
-# for the one caveat that leaves).
+# The RTC holds UTC and keeps it off the LiPo through deep sleep. UK wall-clock
+# is derived at READ time by london_now(), which adds +1h during British Summer
+# Time — worked out from the UTC instant via the last-Sunday rule below. Storing
+# UTC (not local) is what makes BOTH the twice-yearly clocks-change AND a
+# battery-death NTP recovery correct all year round: the March/October switch is
+# just a different answer from the same rule (no re-sync needed), and NTP already
+# returns UTC, so there's no offset to double-count on recovery (§9.16). Every
+# wall-clock read goes through london_now(); rtc.datetime() is read directly only
+# for the UTC-invariant year (clock_valid()).
+#
+# MIGRATION: older builds stored UK LOCAL time in the RTC. migrate_rtc_to_utc_if_
+# needed() re-seeds it from NTP (UTC) once on first run of this build and latches
+# persist["utc_migrated"] so it never runs again (§9.16).
+
+def _last_sunday(year, month):
+    """Day-of-month of the last Sunday in `month`. Only ever called for March and
+    October (both 31 days), so 31 is a safe starting point."""
+    day = 31
+    wd = time.localtime(time.mktime((year, month, day, 12, 0, 0, 0, 0)))[6]  # 0=Mon..6=Sun
+    return day - ((wd - 6) % 7)
+
+def _is_bst(y, mo, d, h):
+    """True if the UTC instant (y, mo, d, h) falls in British Summer Time. BST
+    runs 01:00 UTC on the last Sunday of March -> 01:00 UTC on the last Sunday of
+    October. Deciding from the UTC instant sidesteps the ambiguous/skipped local
+    hour at each boundary entirely (§9.16)."""
+    if mo < 3 or mo > 10:
+        return False
+    if 3 < mo < 10:
+        return True
+    ls = _last_sunday(y, mo)
+    if mo == 3:                      # spring forward at 01:00 UTC
+        if d != ls:
+            return d > ls
+        return h >= 1
+    if d != ls:                      # October: fall back at 01:00 UTC
+        return d < ls
+    return h < 1
 
 def london_now():
-    """UK wall-clock as a localtime-style tuple. The RTC is already on local time,
-    so this is just time.localtime() — kept as a named seam in case a future
-    timezone change ever needs a single place to adjust (§9.16)."""
-    return time.localtime()
+    """UK wall-clock (BST-aware) as a time.localtime()-style tuple
+    (year, month, day, hour, minute, second, weekday, yearday). The RTC holds
+    UTC; this is the single seam that converts it to local time, adding +1h in
+    summer via _is_bst(). All wall-clock reads in the app go through here (§9.16)."""
+    try:
+        y, mo, d, h, mi, s, _ = rtc.datetime()
+        secs = time.mktime((y, mo, d, h, mi, s, 0, 0))
+        if _is_bst(y, mo, d, h):
+            secs += 3600
+        return time.localtime(secs)
+    except Exception:
+        return time.localtime()
 
 def clock_valid():
     """False when the RTC has reset to its 2000 epoch (post battery death; §9.13).
-    Gates the NTP re-sync, quiet hours (§9.17 — never trust an unset clock to
-    decide it's night-time) and the disruption date window (§9.18)."""
+    Reads rtc.datetime() directly — the year is the same in UTC or local, so no
+    conversion is needed here. Gates the NTP re-sync, quiet hours (§9.17 — never
+    trust an unset clock to decide it's night-time) and the disruption date
+    window (§9.18)."""
     try:
         return rtc.datetime()[0] >= RTC_MIN_VALID_YEAR
     except Exception:
         return False
 
 def sync_clock_if_needed():
-    """No-op unless the RTC looks unset (clock_valid() False), i.e. after a
-    battery death. Then re-seed it from NTP and mirror into the system clock.
-    Self-healing: a failed NTP attempt leaves the clock unset and retries next
-    refresh. CAVEAT: time_from_ntp() returns UTC and there's no setter to write a
-    corrected local value, so a death recovered during BST reads 1h behind until
-    fixed — rare, and far better than staying stuck at the 2000 epoch (§9.16)."""
+    """No-op unless the RTC looks unset (clock_valid() False), i.e. after a full
+    battery death. Then re-seed it from NTP (UTC) and mirror into the system
+    clock. Self-healing: a failed NTP attempt leaves the clock unset and retries
+    next refresh. Because the RTC is stored as UTC and london_now() applies the
+    BST offset at read time, an NTP recovery is now correct year-round — the old
+    "1h behind during BST" caveat is gone (§9.16)."""
     try:
         if clock_valid():
             return
-        rtc.time_from_ntp()      # seeds the RTC (UTC; see caveat above)
+        rtc.time_from_ntp()      # seeds the RTC in UTC — matches our stored model
         rtc.rtc_to_localtime()   # mirror into time.localtime()
+    except Exception:
+        pass
+
+def migrate_rtc_to_utc_if_needed():
+    """One-time migration. Older builds stored UK LOCAL time in the RTC; this
+    build stores UTC and converts at read (london_now). Re-seed once from NTP —
+    which returns UTC, our new model — then latch a flag so it never runs again.
+    Requires WiFi to be up; the caller (do_refresh, post-connect) guarantees it.
+    A failure just leaves the flag clear to retry on the next refresh (§9.16)."""
+    if persist.get("utc_migrated"):
+        return
+    try:
+        rtc.time_from_ntp()
+        rtc.rtc_to_localtime()
+        persist["utc_migrated"] = True
+        save_state()
     except Exception:
         pass
 
@@ -297,7 +359,7 @@ def in_quiet_hours():
     end   = _hhmm_to_mins(QUIET_END)
     if start is None or end is None or start == end:
         return False
-    t = rtc.datetime()
+    t = london_now()
     now = t[3] * 60 + t[4]
     if start < end:
         return start <= now < end
@@ -308,7 +370,7 @@ def mins_until_quiet_end():
     end = _hhmm_to_mins(QUIET_END)
     if end is None:
         return QUIET_SLEEP_MINS
-    t = rtc.datetime()
+    t = london_now()
     now = t[3] * 60 + t[4]
     d = end - now
     if d <= 0:
@@ -388,7 +450,7 @@ def _window_active(item):
     if not clock_valid():
         return True
     try:
-        t = rtc.datetime()
+        t = london_now()
         today = "{:04d}-{:02d}-{:02d}".format(t[0], t[1], t[2])
         frm = item.get("fromDate") or ""
         if len(frm) >= 10 and today < frm[:10]:
@@ -406,7 +468,7 @@ def fetch_disruption():
     that clears the warning. Failure leaves the previous state untouched and just
     bumps the counter (inverted fail-safe vs weather; see DISRUPTION_RETRY_BURST)."""
     global disruption, disruption_type, disruption_at, disruption_try_at, disruption_fails
-    t = rtc.datetime()
+    t = london_now()
     disruption_try_at = "{:02d}:{:02d}".format(t[3], t[4])
     ok = False
     try:
@@ -512,7 +574,7 @@ def fetch_arrivals():
             result.append({"line": line, "destination": destination, "minutes": eta_min})
         result.sort(key=lambda b: b["minutes"])
         buses = result[:MAX_BUSES]
-        t = rtc.datetime()
+        t = london_now()
         last_ok_at = "{:02d}:{:02d}".format(t[3], t[4])
         save_state()
         return True
@@ -542,7 +604,7 @@ def fetch_weather():
     for the hourly backoff, and counts consecutive failures in weather_fails to
     drive the retry burst (§8); saves on all paths."""
     global weather, weather_at, weather_try_at, weather_fails
-    t = rtc.datetime()
+    t = london_now()
     weather_try_at = "{:02d}:{:02d}".format(t[3], t[4])
     ok = False
     try:
@@ -591,6 +653,7 @@ def do_refresh(forced=False):
         return
 
     sync_clock_if_needed()   # re-sync the RTC if a battery death reset it (§9.13)
+    migrate_rtc_to_utc_if_needed()   # one-time: move an old LOCAL-time RTC to UTC (§9.16)
 
     # ORDER MATTERS: disruption first. It decides which stop fetch_arrivals()
     # queries, so running it second would leave the panel one cycle behind the
@@ -619,7 +682,7 @@ def minutes_since(hhmm):
     try:
         hh, mm = hhmm.split(":")
         then = int(hh) * 60 + int(mm)
-        t = rtc.datetime()
+        t = london_now()
         now = t[3] * 60 + t[4]
         diff = now - then
         if diff < 0:
@@ -882,7 +945,7 @@ def update():
         # in this role: if it reports True on ALARM wakes the override never
         # expires — see §12 validation; fallback is to drop it from this OR.
         if _button_a_down() or _woken_by_button():
-            t = rtc.datetime()
+            t = london_now()
             persist["quiet_override_at"] = "{:02d}:{:02d}".format(t[3], t[4])
             save_state()
         ov = minutes_since(persist.get("quiet_override_at"))
@@ -894,7 +957,7 @@ def update():
                 save_state()              # HH:MM stamp can't wrap around 24h and
                                           # spuriously re-trigger tomorrow night
                 last_quiet_draw_minute = -1   # repaint over the override's bus UI
-            t = rtc.datetime()
+            t = london_now()
             now_min = t[3] * 60 + t[4]
             elapsed_q = now_min - last_quiet_draw_minute
             if elapsed_q < 0:                          # crossed midnight
@@ -920,7 +983,7 @@ def update():
         save_state()                          # latch (same 24h-wrap reasoning)
         last_quiet_draw_minute = -1
 
-    t = rtc.datetime()
+    t = london_now()
     current_minute = t[3] * 60 + t[4]
     elapsed = current_minute - last_refresh_minute
     if elapsed < 0:                     # crossed midnight
