@@ -1,22 +1,10 @@
-# <img src="icon.png" width="24" alt=""> Badger 2350 — TfL Bus Arrivals Display
+# <img src="icon.png" width="24" alt="App icon"> TfL Bus Arrivals Display for the Pimoroni Badger 2350
 
-A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350) e-ink badge that turns it into a tiny live departures board for a London bus stop, with a one-line weather summary underneath.
+A £30 badge on the wall by the door that tells you whether to run for the bus.
 
-```
-+------------------------------------------------------------+
-| 84%   TFL  Abbey Road                         08:47        |
-|------------------------------------------------------------|
-| Line   Destination                               Min       |
-| ---------------------------------------------------------- |
-| 18     Euston                                      2       |
-| 27     Camden Town                                 5       |
-| ...                                                        |
-| ---------------------------------------------------------- |
-| Sat. 30/05: Partly cloudy             12C (9, 18)          |
-+------------------------------------------------------------+
-```
+![Badger 2350 running the TfL app, showing live bus arrivals and a weather footer](docs/images/badge.jpg)
 
-![Badger 2350 running the app, showing live Abbey Road bus arrivals with a weather line underneath](docs/images/badge.jpg)
+A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/products/badger-2350) e-ink badge that turns it into a tiny live departures board for a London bus stop, using Transport for London's (TfL) open arrivals API, with a one-line weather summary underneath.
 
 ## Features
 
@@ -51,6 +39,22 @@ No TfL API key is required at the default refresh rate (the unauthenticated limi
 
 The `STOP_ID` is TfL's Naptan ID (e.g. `490003028E`). The easiest way to find yours: search your stop on [tfl.gov.uk](https://tfl.gov.uk) bus arrivals and look at the URL, or query
 `https://api.tfl.gov.uk/StopPoint/Search/{your stop name}` in a browser and pick the `id` of the right stop (the trailing letter distinguishes direction/side of road).
+
+Once installed and configured, the display looks like this:
+
+```
++------------------------------------------------------------+
+| 84%   TFL  Abbey Road                         08:47        |
+|------------------------------------------------------------|
+| Line   Destination                               Min       |
+| ---------------------------------------------------------- |
+| 18     Euston                                      2       |
+| 27     Camden Town                                 5       |
+| ...                                                        |
+| ---------------------------------------------------------- |
+| Sat. 30/05: Partly cloudy             12C (9, 18)          |
++------------------------------------------------------------+
+```
 
 ## Configuration
 
