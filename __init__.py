@@ -174,32 +174,14 @@ disruption_at     = persist.get("disruption_at")
 disruption_try_at = persist.get("disruption_try_at")
 disruption_fails  = persist.get("disruption_fails") or 0
 
-# ---- Hang watchdog ---------------------------------------------------------
-# Fixes the weekly daytime freeze: panel stuck on the bus table, A dead, battery
-# draining fast until it dies. That means the chip is AWAKE but our code is no
-# longer running. On firmware v2.0.2 the likeliest spot is the deep-sleep call
-# itself: powman.sleep() hard-asserts if the power-off request is refused, and
-# the board's panic handler then loops forever with the chip powered. A hang in
-# the network stack would look identical. Neither returns to Python, so no
-# try/except can catch it; only the chip's hardware watchdog can.
-#
-# How it works: the watchdog is armed at the start of each battery wake and fed
-# before every step that can legitimately take a while (WiFi join, each HTTP GET,
-# each e-ink push, the sleep). If nothing feeds it for WDT_MS, the chip reboots
-# and the launcher relaunches this app (a watchdog reboot is not a RESET press,
-# so main.py resumes the running app instead of returning to the menu).
-#
-# Deep sleep powers the chip off, which stops the watchdog, so the 2-minute
-# sleeps are unaffected (the old "watchdog ruled out" reasoning in §9.12 missed
-# this). Not armed on USB: there the framework's wait loop spins unfed and never
-# sleeps, so it would reboot every cycle under Thonny.
-#
-# Boot-loop guard: the first wake after a watchdog reboot does NO network work;
-# it just goes back to sleep for REFRESH_MINS. A persistently broken network can
-# therefore cost at most one attempt per two cycles, never a reboot loop with
-# the radio on. The latch alternates, so it can never skip two wakes in a row.
+# ---- Hang watchdog (§9.19) -------------------------------------------------
+# powman.sleep() can hang with the chip powered (frozen panel, draining battery),
+# beyond the reach of try/except. Armed per battery wake, fed before each slow
+# step; deep sleep powers the chip off, so it never trips mid-sleep. Not armed on
+# USB, where the framework's wait loop never sleeps and would trip it. The first
+# wake after a watchdog reboot only sleeps, so it can't boot-loop.
 
-WDT_MS = 16000   # RP2350 allows up to ~16.7 s; falls back to 8000 if refused
+WDT_MS = 16000   # RP2350 max is ~16.7 s; falls back to 8000 if refused
 
 _wdt = None
 _wdt_checked = False
