@@ -12,6 +12,7 @@ A MicroPython app for the [Pimoroni Badger 2350](https://shop.pimoroni.com/produ
 - Current conditions + today's high/low for any location, via wttr.in, refreshed hourly
 - Battery-aware: deep-sleeps between refreshes, shows a voltage-derived charge percentage, and latches into a static low-battery "death screen" instead of dying on stale data which might be missed on a quick glance
 - Quiet hours: parks overnight (default 22:30–05:30) behind a friendly notice, waking only hourly for a clock/battery/weather heartbeat — press A any time to resume live updates during quiet hours
+- Self-recovering: a hardware watchdog reboots the app if the firmware ever hangs while awake, instead of leaving a frozen screen and a dead battery
 - Resilient weather: a failed hourly fetch is retried 3 more times over the next few minutes before the footer is dropped
 - Closure-aware: detects a TfL stop closure (a separate endpoint from arrivals), transparently fails over to a configured neighbour stop, and shows a `{stop} Closed` banner — so you never get live times for a stop no bus will pull into
 - Self-heals its clock after a full battery death (NTP re-sync, gated so it never runs on normal wakes), and keeps the right UK time all year: it stores UTC and applies British Summer Time automatically, so the spring/autumn clock change needs no intervention
@@ -75,7 +76,7 @@ The full list — including timeouts, the low-battery hysteresis pair, the LiPo 
 
 ## How it works (short version)
 
-On battery the app lives in a *wake → fetch → draw → arm alarm → deep sleep* cycle. Deep sleep is a full reset on this firmware, so cached arrivals, weather, and timestamps are persisted to flash via the `State` API and rehydrated on every wake. The RTC alarm that drives the periodic wake is armed with a verified retry — the device only sleeps once an alarm is confirmed set, because sleeping without one means it never wakes again (I learned this the hard way). On USB power the badge never deep-sleeps, so the same loop runs continuously with time-based gating to avoid hammering the e-ink.
+On battery the app lives in a *wake → fetch → draw → arm alarm → deep sleep* cycle. Deep sleep is a full reset on this firmware, so cached arrivals, weather, and timestamps are persisted to flash via the `State` API and rehydrated on every wake. The RTC alarm that drives the periodic wake is armed with a verified retry — the device only sleeps once an alarm is confirmed set, because sleeping without one means it never wakes again (I learned this the hard way). The firmware's sleep call can itself hang on rare occasions with the chip left powered, so on battery a hardware watchdog watches each wake and reboots the badge straight back into the app if it stops responding. On USB power the badge never deep-sleeps, so the same loop runs continuously with time-based gating to avoid hammering the e-ink.
 
 The longer version — architecture, resilience behaviour, and every firmware quirk encountered — lives in the docs:
 

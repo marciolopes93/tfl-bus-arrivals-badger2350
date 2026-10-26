@@ -209,6 +209,17 @@ State.save("tfl", persist)   # save after changes
   exact year-round (NTP's UTC *is* the stored value — no offset to double-count),
   and the March/October clocks-change needs no re-sync because the offset is
   recomputed from the UTC instant on every read.
+- **The RTC drifts, and nothing corrects drift.** Measured 2026-09-08: 1 min 40 s
+  slow against NTP after roughly three months. The NTP re-sync above only fires
+  when the year looks unset, never for drift. The same test confirmed the model
+  on-device: `rtc.datetime()` read `17:31` while London was 18:32 (BST), and
+  writing *local* time into the chip made the header read an hour fast, because
+  `london_now()` then added the BST hour on top. Manual re-seed:
+  `tools/set_clock.py` from the REPL (WiFi, `time_from_ntp()` with retry,
+  `rtc_to_localtime()`). `ntptime` makes one UDP attempt and raises
+  `OSError 110 ETIMEDOUT` when it is dropped, so any caller retries.
+  `rtc.localtime_to_rtc()` works as a setter (system clock to chip), but only
+  ever give it a UTC value. Periodic re-sync is an open item in §12.
 
 ### 5.5 Buttons (`badge`)
 `io` is gone — it's now `badge`. Test a button with `badge.pressed(BUTTON_A)`
@@ -414,6 +425,14 @@ render. Prefer `screen.measure_text()` over arithmetic in new layout code.
   device can never quietly stop warning you about a stop you can't board at. The
   retry-burst counter drives retries only, never expiry.
 
+- **Hang watchdog (§9.19).** On battery, the chip's hardware watchdog is armed
+  for 16 s at the start of each wake and fed before every slow step (WiFi join,
+  each HTTP GET, each e-ink push, the sleep call). If the firmware hangs while
+  awake, the chip reboots itself into the app instead of sitting powered until
+  the battery dies. The first wake after a watchdog reboot only sleeps, so it can
+  never loop. Deep sleep stops the watchdog, so normal 2-minute sleeps are
+  unaffected. Not armed on USB.
+
 - **REFRESH_MINS = 2.** TFL predictions are minute-precision; 2 min halves
   WiFi/display cost vs 1 min while staying useful. Press **A** for an instant
   refresh. The periodic wake is driven by an alarm armed each cycle as a verified
@@ -536,9 +555,13 @@ The hard-won specifics, so we don't repeat them:
     reset). Fix (two parts): (a) `rtc.clear_alarm()` at startup so each fresh wake
     starts from a clean flag; (b) replace the silent arm with a verified retry that
     only deep-sleeps once an alarm is armed, and otherwise returns to let `run()`
-    retry (§5.4 / §8). **Watchdog ruled out:** `machine.WDT` max timeout on RP2350
-    is shorter than the 2-min sleep, so it would spuriously reset every normal
-    cycle. **Pending on-device validation** on battery past the ~48h mark.
+    retry (§5.4 / §8). **Correction (2026-10-04):** an earlier version of this
+    entry ruled a watchdog out, because `machine.WDT`'s ~16.7 s maximum is
+    shorter than the 2-min sleep. That was wrong: deep sleep powers the chip off,
+    which stops the watchdog, so it only counts while the app is awake. A
+    watchdog would not have caught *this* freeze (the chip was off, with no wake
+    source), but it does catch the different, awake-and-hung freeze in §9.19.
+    **Pending on-device validation** on battery past the ~48h mark.
 13. **Full battery death resets the clock to 2000-01-01 (Sat 00:00).** Symptom:
     after the LiPo fully died, the screen came back blank (a normal brownout — the
     panel was mid-`update()` after `screen.clear()`, unlike the §9.12 freeze which
@@ -833,6 +856,69 @@ whether the extra hourly GET pushes the awake window past `AWAKE_MS`.
 
 ---
 
+### 9.19 Weekly daytime freeze with a draining battery (+ hang watchdog)
+
+**Symptom.** Roughly once a week, always in the daytime, the panel froze on the
+bus table. Button A did nothing, and the battery drained fast until the badge
+died, sometimes from above 60%. A reset brought it back.
+
+**Not the §9.12 freeze.** That one was the chip asleep with no wake source:
+dark, but drawing almost no power. A fast drain means the opposite here. The chip
+is awake and powered, but the app's code has stopped running. The app is what
+polls button A, so A is dead too.
+
+**Cause (diagnosed from the firmware source, not caught in the act).** On
+Badgeware v2.0.2, the deep-sleep call `powman.sleep()` hard-asserts if the
+chip's power-off request is refused. The board's panic handler then loops
+forever with the chip powered. It is rare, in the order of one in a few
+thousand sleeps. In the daytime the app sleeps every 2 minutes, about 500 times
+a day, so once a week fits. Overnight quiet hours (§9.17) sleep hourly, which
+fits it never happening at night. A hang inside the network stack would look
+the same. Neither path returns to Python, so no `try/except` can catch it.
+Firmware v3.1.1 still has the same sleep code, so an upgrade alone would not fix
+it.
+
+**Fix: the chip's hardware watchdog.** A 16 s timer that reboots the chip unless
+the app keeps resetting ("feeding") it.
+
+- **Armed once per wake, battery only** (`_wdt_start()`), at `WDT_MS = 16000`,
+  falling back to 8000 if the chip refuses. Not armed on USB: there the
+  framework's wait loop spins unfed and never sleeps, so it would reboot every
+  cycle under Thonny.
+- **Fed** (`_feed()`) at the start of `update()`, during the WiFi join loop,
+  before each HTTP GET, before each e-ink push and just before the sleep call.
+  A normal wake never comes close to 16 s between feeds.
+- **Deep sleep powers the chip off, which stops the watchdog**, so the 2-minute
+  sleeps are unaffected and it costs no battery.
+- **Recovery.** If the chip hangs, the watchdog reboots it. A watchdog reboot is
+  not a RESET press, so the launcher is expected to resume this app rather than
+  the menu. Inferred from the launcher code, not yet observed on the badge.
+- **Boot-loop guard** (`_skip_after_watchdog()`). The first wake after a watchdog
+  reboot does no network work and draws nothing: it arms the alarm and sleeps
+  for `REFRESH_MINS`. A persisted latch (`persist["wdt_skip"]`) alternates, so
+  it can never skip two wakes in a row, and a persistently broken network costs
+  at most one attempt per two cycles, never a reboot loop with the radio on.
+  The only visible sign of a recovery is the panel missing one refresh.
+  The guard relies on `badge.wake_reason()` returning `powman.WAKE_WATCHDOG`
+  after a watchdog reboot. That is also inferred, not observed. If it is wrong,
+  the guard never triggers and every wake after a reboot runs a normal refresh.
+- **Plugging in USB mid-wake** while the watchdog is armed forces one reboot.
+  Harmless.
+
+**Verification.** Compiled clean with `mpy-cross`. A simulation harness ran a
+normal wake, three back-to-back watchdog wakes, a normal wake after them and a
+USB session: the watchdog armed only on battery, fed at every step, and the
+skip latch alternated as designed. Installed on the badge 2026-10-04 (still
+firmware v2.0.2). It then ran to 2026-10-26, about three weeks, with no frozen
+screen and no unexplained battery death, against a previous rate of about one a
+week. The app does not log watchdog resets, so whether the watchdog actually
+fired in that period is unknown; the evidence is that the freeze stopped.
+
+**Keep it after any firmware upgrade.** It does not stop the firmware glitch; it
+makes the app recover from it, and v3.1.1 has the same glitch.
+
+---
+
 
 ## 10. Config knobs (top of `__init__.py`)
 
@@ -865,6 +951,9 @@ Layout constants near the drawing helpers rather than in the config block:
 Also tweakable in code (not config-block constants): destination names truncate
 at 23 characters in `fetch_arrivals()` (`[:22] + "~"`; widened from 20), and the
 footer's left label at 28.
+
+`WDT_MS` (hang-watchdog timeout, 16000; §9.19) sits with the watchdog code
+rather than in the config block. Don't raise it: the RP2350 maximum is ~16.7 s.
 
 Not a config-block constant but tunable: `_LIPO_CURVE` (the battery
 voltage→% mapping, §5.6). To calibrate the empty end, run the cell down, note
@@ -950,6 +1039,17 @@ darkens.
   screen is a battery glyph with a black "remaining" sliver, light-grey "empty"
   cells (`color.smoke` under `FULL_UPDATE`; §9.15) and the reading centred inside.
 - Optional: register a TFL app key if usage ever scales.
+- **DONE — weekly daytime freeze (§9.19).** Hardware watchdog with a boot-loop
+  guard, on battery only. Installed 2026-10-04; no freeze in the three weeks to
+  2026-10-26. Keep it through any firmware upgrade.
+- **Periodic NTP re-sync for clock drift (§5.4).** The RTC ran 1 min 40 s slow
+  over ~3 months, and the app only re-syncs after a battery death. A once-a-day
+  `time_from_ntp()` (with retry) on the hourly weather slot would fix it.
+  `tools/set_clock.py` is the manual fix meanwhile.
+- **Firmware v3.1.1 upgrade (separate job).** Not done alongside the watchdog so
+  that the watchdog's test stayed clean. It needs app changes (font API, text
+  rendering, a device filesystem reset) and keeps the §9.19 glitch, so the
+  watchdog stays.
 - **DONE — death-recovery clock during BST (§9.16).** Resolved by storing UTC in
   the RTC and deriving UK local time at read time in `london_now()`, so NTP's UTC
   seed needs no local-write path at all. Also removed the twice-yearly

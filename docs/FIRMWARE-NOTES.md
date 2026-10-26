@@ -28,6 +28,7 @@ Without an armed `rtc.set_alarm(...)`, `wait_for_button_or_alarm` can only ever 
 - A silently swallowed `set_alarm()` failure (`try/except: pass`) before sleeping means the device sleeps **with no wake source** and appears bricked until a button/reset. Over ~1,400 two-minute cycles the cumulative odds of one such failure caught up with this app at roughly the 48-hour mark. The fix: `rtc.clear_alarm()` at startup (a latched stale flag is a wedge candidate), then a verified retry-arm that only enters sleep once `set_alarm` succeeded, and otherwise returns so the framework re-calls `update()`. (§5.4, §9.12)
 - There is **no reliable "is an alarm armed?" query** — `rtc.alarm_status()` reads the *fired* flag, not the armed state. You can only catch arming exceptions.
 - `rtc.set_alarm(hours, minutes, seconds)` is a **relative delay** on v2.x, not v4's absolute wall-clock time.
+- **The sleep call itself can hang.** `powman.sleep()` hard-asserts if the chip's power-off request is refused, and the panic handler then loops with the chip powered: a frozen panel, dead buttons and a fast-draining battery. It is rare (in the order of one in a few thousand sleeps) and still present in v3.1.1. Python can't catch it, so arm the hardware watchdog (`machine.WDT`, max ~16.7 s on RP2350) on battery and feed it through each wake. Deep sleep powers the chip off and stops the watchdog, so it doesn't fight the sleep interval. Don't arm it on USB, where the framework's wait loop never sleeps and would trip it. (§9.19)
 
 A possibly cleaner mechanism, `badge.sleep(seconds)` (atomic arm+sleep), is documented in `HANDOFF.md` §12.1 with a verification checklist — proposed, not yet adopted.
 
@@ -45,6 +46,8 @@ Consequences for anyone editing time code:
 - **Never add a timezone offset anywhere except inside `london_now()`.** Every wall-clock read (header clock, quiet hours, disruption date window, `weather_at`/`last_ok_at` stamps, refresh cadence) goes through `london_now()` and is therefore already local. Reading `rtc.datetime()` directly gives you **UTC** — only do that where the value is timezone-invariant (e.g. `clock_valid()`'s year check).
 - A **full** battery death still wipes the RTC to the 2000-01-01 epoch; `sync_clock_if_needed()` re-seeds from NTP (UTC) on the next successful connection. With UTC storage there is no BST caveat left — recovery is correct in summer and winter.
 - **Migration:** older installs hold *local* time in the RTC. `migrate_rtc_to_utc_if_needed()` re-seeds once from NTP on the first WiFi-up refresh of this build and latches `persist["utc_migrated"]`, so it never repeats. (§5.4, §9.13, §9.16)
+
+The RTC also drifts (1 min 40 s slow after ~3 months, measured 2026-09-08), and nothing re-syncs it short of a battery death; `tools/set_clock.py` re-seeds it from the REPL. `rtc.localtime_to_rtc()` works as a setter (system clock to chip), but only ever give it a UTC value. (§5.4, §12)
 
 `rtc.rtc_to_localtime()` copies the RTC into the system clock — called at startup and after an NTP re-seed. Note that with UTC storage the *system* clock (`time.localtime()` with no argument) is UTC; app display never uses it directly — it goes through `london_now()`.
 

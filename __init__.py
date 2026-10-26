@@ -10,6 +10,7 @@ import sys
 import os
 import time
 import socket
+import machine
 import json   # at top (not lazy): needed at startup for State hydration below
 
 sys.path.insert(0, "/system/apps/tfl")
@@ -146,6 +147,7 @@ persist = {
     "disruption_at":     None, # up to an hour until the next hourly fetch (§9.18)
     "disruption_try_at": None,
     "disruption_fails":  0,
+    "wdt_skip":   False,       # hang watchdog: skip-one-cycle latch (see below)
     "low_power":  False,       # latched low-battery pause state
     "quiet_override_at": None, # "HH:MM" A was pressed during quiet hours (§9.17)
     "utc_migrated": False,     # one-time: RTC moved from the old LOCAL-time model
@@ -171,6 +173,83 @@ disruption_type   = persist.get("disruption_type")
 disruption_at     = persist.get("disruption_at")
 disruption_try_at = persist.get("disruption_try_at")
 disruption_fails  = persist.get("disruption_fails") or 0
+
+# ---- Hang watchdog ---------------------------------------------------------
+# Fixes the weekly daytime freeze: panel stuck on the bus table, A dead, battery
+# draining fast until it dies. That means the chip is AWAKE but our code is no
+# longer running. On firmware v2.0.2 the likeliest spot is the deep-sleep call
+# itself: powman.sleep() hard-asserts if the power-off request is refused, and
+# the board's panic handler then loops forever with the chip powered. A hang in
+# the network stack would look identical. Neither returns to Python, so no
+# try/except can catch it; only the chip's hardware watchdog can.
+#
+# How it works: the watchdog is armed at the start of each battery wake and fed
+# before every step that can legitimately take a while (WiFi join, each HTTP GET,
+# each e-ink push, the sleep). If nothing feeds it for WDT_MS, the chip reboots
+# and the launcher relaunches this app (a watchdog reboot is not a RESET press,
+# so main.py resumes the running app instead of returning to the menu).
+#
+# Deep sleep powers the chip off, which stops the watchdog, so the 2-minute
+# sleeps are unaffected (the old "watchdog ruled out" reasoning in §9.12 missed
+# this). Not armed on USB: there the framework's wait loop spins unfed and never
+# sleeps, so it would reboot every cycle under Thonny.
+#
+# Boot-loop guard: the first wake after a watchdog reboot does NO network work;
+# it just goes back to sleep for REFRESH_MINS. A persistently broken network can
+# therefore cost at most one attempt per two cycles, never a reboot loop with
+# the radio on. The latch alternates, so it can never skip two wakes in a row.
+
+WDT_MS = 16000   # RP2350 allows up to ~16.7 s; falls back to 8000 if refused
+
+_wdt = None
+_wdt_checked = False
+
+def _wdt_start():
+    """Arm the hardware watchdog once per boot, on battery only."""
+    global _wdt
+    if _wdt is not None:
+        return
+    try:
+        if badge.usb_connected():
+            return
+    except Exception:
+        return
+    for ms in (WDT_MS, 8000):
+        try:
+            _wdt = machine.WDT(timeout=ms)
+            return
+        except Exception:
+            pass
+
+def _feed():
+    """Tell the watchdog we're still alive. No-op when it isn't armed."""
+    if _wdt is not None:
+        try:
+            _wdt.feed()
+        except Exception:
+            pass
+
+def _woken_by_watchdog():
+    try:
+        import powman
+        return badge.wake_reason() == powman.WAKE_WATCHDOG
+    except Exception:
+        return False
+
+def _skip_after_watchdog():
+    """True if this wake should do nothing but sleep (see boot-loop guard)."""
+    global _wdt_checked
+    if _wdt_checked:
+        return False
+    _wdt_checked = True
+    if _woken_by_watchdog() and not persist.get("wdt_skip"):
+        persist["wdt_skip"] = True
+        save_state()
+        return True
+    if persist.get("wdt_skip"):
+        persist["wdt_skip"] = False
+        save_state()
+    return False
 
 # ---- Input helpers ---------------------------------------------------------
 
@@ -400,6 +479,7 @@ def connect_wifi():
         if not wlan.isconnected():
             wlan.connect(secrets.WIFI_SSID, secrets.WIFI_PASSWORD)
             for _ in range(20):
+                _feed()
                 if wlan.isconnected():
                     break
                 time.sleep(0.5)
@@ -412,6 +492,7 @@ def connect_wifi():
 def _get(url):
     """HTTP GET with timeout. `requests` works on this firmware; stock uses
     `urequests` if it ever breaks (TypeError fallback documented in §8)."""
+    _feed()
     import requests
     try:
         return requests.get(url, timeout=REQ_TIMEOUT)
@@ -905,10 +986,17 @@ def arm_and_sleep(mins):
         except Exception:
             time.sleep(0.2)
     if armed:
+        _feed()
         wait_for_button_or_alarm(timeout=AWAKE_MS)
 
 def update():
     global initialised, last_refresh_minute, last_quiet_draw_minute
+
+    _wdt_start()                        # hang watchdog (battery only; see above)
+    _feed()
+    if _skip_after_watchdog():          # first wake after a watchdog reboot:
+        arm_and_sleep(REFRESH_MINS)     # no network, no redraw, just sleep
+        return
 
     charging, volts = read_battery()    # BEFORE WiFi comes up (ADC skew); §5.6
     bat_str = battery_str_from(charging, volts)
@@ -928,6 +1016,7 @@ def update():
             return
     elif (not charging) and (volts is not None) and (volts <= LOW_BATT_VOLTS):
         draw_low_battery(bat_str, volts)
+        _feed()
         badge.update()
         persist["low_power"] = True
         save_state()
@@ -973,6 +1062,7 @@ def update():
                     if wifi_connected():
                         fetch_weather()
                 draw_quiet_screen(bat_str, london_now())
+                _feed()
                 badge.update()
                 last_quiet_draw_minute = now_min
             # Chunked sleep, capped so the first normal refresh lands at QUIET_END
@@ -1064,6 +1154,7 @@ def update():
 
     # Push e-ink only when we refreshed (avoids constant redraw on USB; §5.3)
     if should_refresh:
+        _feed()
         badge.update()
 
     arm_and_sleep(REFRESH_MINS)   # verified-retry arm + deep sleep (§5.4 / §9.12)
